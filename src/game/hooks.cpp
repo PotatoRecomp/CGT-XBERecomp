@@ -61,9 +61,10 @@ X86_FUNC(sub_00112D2D) {
 // +0x678 in degrees a second. On foot the camera takes its yaw from the body, and the body (0x7ADEA) turns by a rate
 // at +0x67C that follows +0x678 with a 0.1 s lag, as an angular velocity its physics body integrates.
 //
-// The mouse skips all of it: its counts times the sensitivity are degrees, added to the camera's pitch and yaw before
-// the look function's own clamps and wrap run on them, and handed to the body as exactly that much turn this frame,
-// outside the 0.1 s lag. Positive yaw turns right and positive pitch looks down, so counts right and down add.
+// The mouse (and on Android a finger's swipe, input::OnTouchLook) skips all of it: its counts times the sensitivity are
+// degrees, added to the camera's pitch and yaw before the look function's own clamps and wrap run on them, and handed
+// to the body as exactly that much turn this frame, outside the 0.1 s lag. Positive yaw turns right and positive pitch
+// looks down, so counts right and down add.
 namespace {
 
 constexpr uint32_t kGameApp = 0x4DA6B0;        // +8 the input manager
@@ -99,14 +100,11 @@ bool MouseLook(uint32_t character, float& yaw, float& pitch) {
     bool any_pad = input && R32(input + kInputAnyPad) != 0;
     // the mouse is on port 0: player 1, or the one player of a game taken by any controller
     if (player == 0xFFFFFFFFu || (player != 0 && !any_pad)) return false;
-    float dx, dy;
-    if (!input::TakeMouseLook(dx, dy)) return false;
-    const game::Options& o = game::Opt();
+    if (!input::TakeLook(yaw, pitch)) return false;
     float zoom = RF(control + kControlZoom);
     if (!(zoom > 0.0f && zoom <= 1.0f)) zoom = 1.0f;
-    float degrees = game::kMouseDegreesPerCount * float(o.mouse_sensitivity) * 0.01f * zoom;
-    yaw = dx * degrees;
-    pitch = (o.mouse_invert_y ? -dy : dy) * degrees;
+    yaw *= zoom;
+    pitch *= zoom;
     return true;
 }
 

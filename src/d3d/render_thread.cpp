@@ -2,7 +2,11 @@
 // takes at call time (state changes, resource headers, indices, rects) and goes on; vertex, texture and surface memory
 // are read when the draw runs, as the console's GPU reads them after the call returns. The XDK's fences, busy checks
 // and locks wait for that.
+#if defined(__aarch64__)
+#include <arm_neon.h>
+#else
 #include <smmintrin.h>
+#endif
 
 #include <algorithm>
 #include <chrono>
@@ -76,11 +80,17 @@ std::vector<Range> StateRanges() {
 // equal bytes, 16 at a time: most of the state is compared on every draw
 bool Same(const uint8_t* a, const uint8_t* b, size_t n) {
     size_t i = 0;
+#if defined(__aarch64__)
+    uint8x16_t diff = vdupq_n_u8(0);
+    for (; i + 16 <= n; i += 16) diff = vorrq_u8(diff, veorq_u8(vld1q_u8(a + i), vld1q_u8(b + i)));
+    if (vmaxvq_u8(diff)) return false;
+#else
     __m128i diff = _mm_setzero_si128();
     for (; i + 16 <= n; i += 16)
         diff = _mm_or_si128(diff, _mm_xor_si128(_mm_loadu_si128(reinterpret_cast<const __m128i*>(a + i)),
                                                 _mm_loadu_si128(reinterpret_cast<const __m128i*>(b + i))));
     if (!_mm_testz_si128(diff, diff)) return false;
+#endif
     return i == n || !std::memcmp(a + i, b + i, n - i);
 }
 

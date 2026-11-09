@@ -18,6 +18,7 @@ uint16_t HeldOnAnyController();  // face buttons as XINPUT_GAMEPAD_A/B/X/Y masks
 // the controller on that port, then GameInfo::pad
 Pad Poll(int port);
 Pad Read(int port);  // the controller alone, GameInfo::pad left out
+bool Connected();    // a real controller is plugged in, GameInfo::pad and the keyboard left out
 void Rumble(int port, uint16_t left, uint16_t right);
 
 }  // namespace input

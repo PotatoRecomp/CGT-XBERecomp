@@ -2,8 +2,8 @@
 #include <atomic>
 #include <cstdint>
 
-// The recomp's own settings, shown on the F10 panel (common/menu.cpp) and saved to the settings file; the renderer
-// (d3d/vulkan_linux.cpp) reads them every frame.
+// The recomp's own settings, shown on the F10 panel (common/menu.cpp; on Android SettingsDialog.java through
+// android/native/settings_bridge.cpp) and saved to the settings file; the renderer reads them every frame.
 namespace game {
 
 // the present's look, as MostWanted-Android's screen filters
@@ -26,10 +26,17 @@ struct Options {
     bool mouse_look = true;
     bool mouse_invert_y = false;
     uint32_t mouse_sensitivity = 100;  // percent of kMouseDegreesPerCount
+    // Android: a finger dragged on the screen turns the view the same way, by its travel in dp (input::OnTouchLook)
+    uint32_t touch_sensitivity = 100;  // percent of kTouchDegreesPerDp
+    bool touch_invert_y = false;
+    uint32_t controls_opacity = 100;   // the on-screen controls, percent
 };
 
 // degrees of turn for a mouse count at 100% sensitivity, the scale most PC shooters use
 constexpr float kMouseDegreesPerCount = 0.022f;
+// degrees of turn for a dp a finger travels at 100%: a swipe across half a phone held sideways (about 400 dp) turns
+// the view round by 100 degrees
+constexpr float kTouchDegreesPerDp = 0.25f;
 
 inline Options& Opt() {
     static Options options;

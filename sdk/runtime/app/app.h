@@ -116,4 +116,9 @@ extern const GameInfo kGame;
 // sleeps out the rest of the frame for the fps cap
 void Pace();
 
+// the app in the background: the game's thread waits here at its Swap, before any lock, until it is in front again
+// (Android); the guest clock stands still meanwhile
+void WaitWhileUnfocused();
+bool FocusPaused();
+
 }  // namespace app

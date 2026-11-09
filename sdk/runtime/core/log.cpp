@@ -10,6 +10,10 @@
 #include <thread>
 #include <vector>
 
+#ifdef __ANDROID__
+#include <android/log.h>
+#endif
+
 namespace fs = std::filesystem;
 
 namespace logx {
@@ -17,6 +21,8 @@ namespace logx {
 static std::mutex g_mutex;
 static FILE* g_file = nullptr;
 static std::string g_path;
+static std::string g_error_path, g_error_header;  // ErrorFile's, until its first error opens the file
+static bool g_errors_only = false;
 static auto g_start = std::chrono::steady_clock::now();
 
 constexpr int kKeep = 30;
@@ -51,6 +57,13 @@ void Init(const std::string& dir, const std::string& prefix, bool append) {
 
 const std::string& Path() { return g_path; }
 
+void ErrorFile(const std::string& path, const std::string& header) {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    g_error_path = path;
+    g_error_header = header;
+    g_errors_only = true;
+}
+
 void Write(Level lv, const char* fmt, ...) {
     if (!kVerbose && lv < Level::Error) return;
     char msg[4096];
@@ -66,11 +79,25 @@ void Write(Level lv, const char* fmt, ...) {
     int n = kVerbose ? std::snprintf(line, sizeof(line), "[%9.3f] [%s] [t%04zx] %s\n", t, names[int(lv)], size_t(tid), msg)
                      : std::snprintf(line, sizeof(line), "[%9.3f] %s%s\n", t, lv == Level::Error ? "error: " : "", msg);
     n = std::min(n, int(sizeof(line)) - 1);
-    if (g_file) {
+    if (lv == Level::Error && !g_error_path.empty()) {
+        // the first error opens the error file in place of the log the run had
+        if (g_file) std::fclose(g_file);
+        g_file = std::fopen(g_error_path.c_str(), "w");
+        if (g_file) std::fputs(g_error_header.c_str(), g_file);
+        g_path = g_error_path;
+        g_error_path.clear();
+    }
+    if (g_file && (!g_errors_only || lv == Level::Error)) {
         std::fwrite(line, 1, size_t(n), g_file);
         if (lv >= Level::Warn) std::fflush(g_file);
     }
+#ifdef __ANDROID__
+    // an app's stderr goes nowhere on Android: logcat carries the lines instead
+    __android_log_write(lv == Level::Error ? ANDROID_LOG_ERROR : lv == Level::Warn ? ANDROID_LOG_WARN : ANDROID_LOG_INFO,
+                        "cgt", line);
+#else
     std::fwrite(line, 1, size_t(n), stderr);
+#endif
 }
 
 void Flush() {

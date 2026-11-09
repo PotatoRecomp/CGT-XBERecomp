@@ -44,6 +44,11 @@ const cpu_set_t& ProcessCpus() {
 #ifndef _WIN32
 int GuestCpu() {
     static const int cpu = [] {
+#ifdef __ANDROID__
+        // a phone's big core shared by the game's main thread and its sound and timer threads holds the frame rate
+        // down; the game's threads run on any core there
+        return -1;
+#endif
         const char* opt = std::getenv("XBE_GUEST_CORES");
         if (opt && std::string(opt) == "all") return -1;
         const cpu_set_t allowed = ProcessCpus();

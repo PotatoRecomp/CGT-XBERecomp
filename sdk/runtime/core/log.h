@@ -14,6 +14,9 @@ void Init(const std::string& dir, const std::string& prefix, bool append = false
 void Write(Level lv, const char* fmt, ...) __attribute__((format(printf, 2, 3)));
 void Flush();
 const std::string& Path();
+// errors alone to path, the file made at a run's first one and header written first: a run with none leaves the last
+// one's file as it was (Android: the error log in the game's folder, where a player finds it)
+void ErrorFile(const std::string& path, const std::string& header);
 
 #ifdef NDEBUG
 inline constexpr bool kVerbose = false;

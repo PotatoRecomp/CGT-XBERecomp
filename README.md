@@ -46,6 +46,17 @@ The game runs natively on Linux, drawn with Vulkan. The recompiled game code is 
 - A 64-bit distribution with a Vulkan 1.3 driver supporting `VK_KHR_push_descriptor` (Mesa 23 or newer, NVIDIA 535 or newer)
 - A CPU with SSE4.2 and POPCNT, 4 GB of memory
 
+## Android
+The `android` folder builds the same recompiled code into an APK for arm64 phones with Vulkan 1.1, following the Def Jam Android port: SDL3's activity runs the game, drawn by an Android version of the Vulkan renderer (`android/native/vulkan.cpp`, shaders compiled on the phone through glslang).
+- **Game files:** a `CGT` folder on the phone's storage (`/storage/emulated/0/CGT`) or at the top of an SD card, with the disc image (`.iso`) or `default.xbe` and its files. The app asks for all files access, or imports a disc image picked from Android's file picker. Saves go in `hdd` beside the game; errors and crashes in `cgt.log` there.
+- **Settings:** the F10 panel is an Android dialog (`SettingsDialog.java`), opened by the gear at the top of the screen or F10 on a keyboard, with the desktop panel's display, graphics, screen filter and audio rows plus the touch controls'. Values are saved as they change.
+- **Touch controls:** the Xbox pad's buttons and left stick as an overlay (`TouchControls.java`), each control movable and sizable (MOVE CONTROLS). There is no on-screen right stick: a finger dragged on the free right side of the screen, or a thumb held on FIRE, turns the view the way the mouse does, its travel in dp added straight to the game's look angles (**LOOK SENSITIVITY** 1.00 is 0.25 degrees a dp, **LOOK INVERT Y**). A controller plugged in hides the overlay; a mouse still turns the view through mouse look.
+
+### Building for Android
+1. Add the game to `assets`, as for Linux.
+2. Install the Android SDK with NDK 30.0.16138531 and CMake 3.22.1 (Android Studio's SDK manager), JDK 17, and CMake, Ninja, Git and a C++ compiler for this PC.
+3. Run `android/build.sh`. It writes `config/game.toml` and recompiles `generated/game` if the desktop build has not (shared with it), then builds `android/app/build/outputs/apk/release/app-release.apk`, signed with the debug key.
+
 ## Status
 Boots through the intro movies and menus into missions, with sound. Menu titles and items appear as scrambled letters for about a second before settling; that is the game's own reveal animation.
 

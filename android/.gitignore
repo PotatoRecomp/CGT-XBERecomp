@@ -1,0 +1,20 @@
+# dependencies Gradle and CMake fetch
+/third_party/
+
+# build
+/out/
+/build/
+/app/build/
+.cxx/
+.gradle/
+.kotlin/
+*.apk
+*.aab
+
+# machine and signing
+local.properties
+*.jks
+*.keystore
+
+# editors
+*.iml

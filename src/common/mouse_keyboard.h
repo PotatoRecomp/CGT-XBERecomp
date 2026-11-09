@@ -12,9 +12,13 @@ bool WheelHeld();               // a wheel notch, held as a button for a moment
 // mouse look on) and adds up its raw counts; the game thread takes them where it turns the view (game/hooks.cpp).
 void SyncMouseCapture();                 // window thread: grab or let go of the mouse as the state says
 void OnMouseMotion(float dx, float dy);  // window thread: a relative motion event's counts
-// game thread: the counts since the last take, x right and y down; false when there are none. Counts that waited
-// longer than a moment (the game paused, a cutscene, a menu) are dropped rather than turned all at once.
-bool TakeMouseLook(float& dx, float& dy);
+// Touch look (Android): a finger's travel in dp, x right and y down, added up beside the mouse's counts and turned the
+// same way, straight into the look angles rather than through the right stick; any thread
+void OnTouchLook(float dx, float dy);
+// game thread: the turn asked for since the last take in degrees, each source's sensitivity and invert Y applied, x
+// right and y down, before the zoom's scaling; false when there is none. Motion that waited longer than a moment (the
+// game paused, a cutscene, a menu) is dropped rather than turned all at once.
+bool TakeLook(float& yaw, float& pitch);
 
 }  // namespace input
 

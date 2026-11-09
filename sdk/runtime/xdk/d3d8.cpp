@@ -237,6 +237,11 @@ void VerticalBlank(X86Context& ctx) {
     uint32_t info = mem::AllocSystem(12), shown = 0;
     auto next = clock::now();
     for (;;) {
+        // films and fades pace on the count: it stands still through a focus pause
+        while (app::FocusPaused()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+            next = clock::now();
+        }
         next = std::max(next + std::chrono::microseconds(16667), clock::now());
         std::this_thread::sleep_until(next);
         uint32_t count = Dev(XDK_CDevice_VBlankCount) + 1, swaps = Dev(kDevSwapCount);
@@ -594,6 +599,7 @@ std::atomic<uint32_t> g_presents{0};
 }  // namespace
 
 HLE_STDCALL(D3DDevice_Swap, 1) {
+    app::WaitWhileUnfocused();
     app::SplashFirstFrame();
     // handed over from the previous instance: the window opens on the second frame, the first picture with
     // anything drawn over it right after

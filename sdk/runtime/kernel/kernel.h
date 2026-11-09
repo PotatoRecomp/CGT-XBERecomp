@@ -1,4 +1,5 @@
 #pragma once
+#include <chrono>
 #include <array>
 #include <atomic>
 #include <condition_variable>
@@ -155,6 +156,11 @@ int32_t PulseEvent(Object& o);
 int32_t ReleaseSemaphore(Object& o, int32_t count, uint32_t& status);
 int32_t ReleaseMutant(Object& o, uint32_t& status);
 int64_t Now100ns();                           // system time, 100 ns since 1601
+// The guest's clocks (the time stamp counter, KeTickCount, KeInterruptTime, the performance counter) run on this: the
+// host's steady clock less the time it was held. It is held while the app waits in the background
+// (app::WaitWhileUnfocused, Android), so the title does not come back to seconds that passed with its frame standing still
+std::chrono::steady_clock::time_point GuestNow();
+void HoldGuestClock(bool hold);
 int64_t ToDeadline(int64_t due_100ns);        // relative or absolute to a steady clock deadline in ns
 void QueueDpc(uint32_t dpc, uint32_t arg1, uint32_t arg2);
 struct Thread;

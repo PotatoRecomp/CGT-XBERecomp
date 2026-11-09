@@ -1,6 +1,7 @@
 // Keyboard and mouse buttons as the controller on port 0, on top of a real pad plugged in there (as UCRR and Black).
 // Mouse motion is not a stick: its raw counts are added up here and turned into the game's look angles directly by
-// game/hooks.cpp, past the stick's dead zone, response, clamp and turn smoothing.
+// game/hooks.cpp, past the stick's dead zone, response, clamp and turn smoothing. A finger's swipe on Android goes the
+// same way (OnTouchLook).
 #include <SDL3/SDL.h>
 
 #include <atomic>
@@ -30,9 +31,10 @@ uint64_t NowMs() {
     return uint64_t(std::chrono::duration_cast<std::chrono::milliseconds>(since).count()) + 1;
 }
 
-// counts since the game last took them; doubles so a long session of small moves loses nothing
+// counts and dp since the game last took them; doubles so a long session of small moves loses nothing
 std::mutex g_look_lock;
 double g_look_x = 0, g_look_y = 0;
+double g_touch_x = 0, g_touch_y = 0;
 uint64_t g_look_taken = 0;           // NowMs of the last take
 constexpr uint64_t kLookStaleMs = 250;  // counts older than this were made while nothing turned the view
 
@@ -51,6 +53,10 @@ void StartMouse(void* window) {
 void SyncMouseCapture() {
     if (!g_window) return;
     bool want = game::Opt().mouse_look && !app::MenuOpen() && Focused();
+#ifdef __ANDROID__
+    // pointer capture only for a mouse that is there: the screen's fingers are the touch overlay's
+    want = want && SDL_HasMouse();
+#endif
     if (SDL_GetWindowRelativeMouseMode(g_window) == want) return;
     SDL_SetWindowRelativeMouseMode(g_window, want);
     std::lock_guard lock(g_look_lock);
@@ -64,16 +70,37 @@ void OnMouseMotion(float dx, float dy) {
     g_look_y += dy;
 }
 
-bool TakeMouseLook(float& dx, float& dy) {
-    uint64_t now = NowMs();
+void OnTouchLook(float dx, float dy) {
+    if (app::MenuOpen()) return;
     std::lock_guard lock(g_look_lock);
-    bool stale = now - g_look_taken > kLookStaleMs;
-    g_look_taken = now;
-    dx = float(g_look_x);
-    dy = float(g_look_y);
-    g_look_x = g_look_y = 0;
-    if (stale || !game::Opt().mouse_look) return false;
-    return dx != 0 || dy != 0;
+    g_touch_x += dx;
+    g_touch_y += dy;
+}
+
+bool TakeLook(float& yaw, float& pitch) {
+    uint64_t now = NowMs();
+    double mx, my, tx, ty;
+    {
+        std::lock_guard lock(g_look_lock);
+        bool stale = now - g_look_taken > kLookStaleMs;
+        g_look_taken = now;
+        mx = g_look_x, my = g_look_y, tx = g_touch_x, ty = g_touch_y;
+        g_look_x = g_look_y = g_touch_x = g_touch_y = 0;
+        if (stale) return false;
+    }
+    const game::Options& o = game::Opt();
+    yaw = pitch = 0;
+    if (o.mouse_look && (mx != 0 || my != 0)) {
+        float degrees = game::kMouseDegreesPerCount * float(o.mouse_sensitivity) * 0.01f;
+        yaw += float(mx) * degrees;
+        pitch += float(o.mouse_invert_y ? -my : my) * degrees;
+    }
+    if (tx != 0 || ty != 0) {
+        float degrees = game::kTouchDegreesPerDp * float(o.touch_sensitivity) * 0.01f;
+        yaw += float(tx) * degrees;
+        pitch += float(o.touch_invert_y ? -ty : ty) * degrees;
+    }
+    return yaw != 0 || pitch != 0;
 }
 
 void OnMouseWheel(float y) {

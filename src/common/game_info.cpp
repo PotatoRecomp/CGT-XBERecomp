@@ -8,6 +8,9 @@
 #include "common/mouse_keyboard.h"
 #include "common/options.h"
 #include "core/input.h"
+#ifdef __ANDROID__
+#include "host.h"
+#endif
 
 namespace game {
 void InstallCaptureSignal();
@@ -20,6 +23,11 @@ void Load(const void* table) {
     o.msaa = uint32_t(t["msaa"].value_or(int64_t(o.msaa)));
     o.screen_filter = std::min(uint32_t(t["screen_filter"].value_or(int64_t(o.screen_filter))), uint32_t(kFilterHdr));
     o.mouse_sensitivity = std::clamp(o.mouse_sensitivity, uint32_t(5), uint32_t(1000));
+#ifdef __ANDROID__
+    o.touch_sensitivity = std::clamp(o.touch_sensitivity, uint32_t(10), uint32_t(500));
+    o.controls_opacity = std::clamp(o.controls_opacity, uint32_t(0), uint32_t(100));
+    host::LoadSettings(table);
+#endif
 }
 
 void Save(void* table) {
@@ -27,6 +35,9 @@ void Save(void* table) {
     const Options& o = Opt();
     t.insert_or_assign("msaa", int64_t(o.msaa));
     t.insert_or_assign("screen_filter", int64_t(o.screen_filter));
+#ifdef __ANDROID__
+    host::SaveSettings(table);
+#endif
 }
 
 }  // namespace
@@ -54,6 +65,11 @@ const app::GameInfo app::kGame = {
         {"mouse_invert_y", &game::Opt().mouse_invert_y, nullptr},
         {"mouse_sensitivity", nullptr, &game::Opt().mouse_sensitivity},
         {"volume", nullptr, &game::Opt().volume},
+#ifdef __ANDROID__
+        {"touch_sensitivity", nullptr, &game::Opt().touch_sensitivity},
+        {"touch_invert_y", &game::Opt().touch_invert_y, nullptr},
+        {"controls_opacity", nullptr, &game::Opt().controls_opacity},
+#endif
     },
     .load = game::Load,                    // reads more from the settings file's toml::table
     .save = game::Save,                    // writes more into it
@@ -61,8 +77,13 @@ const app::GameInfo app::kGame = {
     .loaded = nullptr,                     // image in memory, before its entry point runs
     .window = input::StartMouse,           // the game window is up
     .message = nullptr,                    // window messages first; true takes one
+#ifdef __ANDROID__
+    .ui = host::Ui,                        // the FPS counter; the settings panel is SettingsDialog.java
+    .pad = host::Pad,                      // the keyboard's pad with the on-screen controls over it
+#else
     .ui = app::DrawUi,                     // ImGui drawing each frame
     .pad = game::PadHook,                  // changes a polled pad
+#endif
     .rumble = nullptr,                     // changes a rumble before it is set
-    .event = game::Event,                  // Linux: window thread, each SDL_Event after ImGui's
+    .event = game::Event,                  // Linux and Android: window thread, each SDL_Event after ImGui's
 };
