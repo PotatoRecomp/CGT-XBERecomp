@@ -161,6 +161,9 @@ int64_t Now100ns();                           // system time, 100 ns since 1601
 // (app::WaitWhileUnfocused, Android), so the title does not come back to seconds that passed with its frame standing still
 std::chrono::steady_clock::time_point GuestNow();
 void HoldGuestClock(bool hold);
+// KeTickCount as it is now, milliseconds of the guest clock since the kernel started: exact on each call, where the
+// copy in the title's memory is only as fresh as the thread that writes it. Any thread
+uint32_t TickCount();
 int64_t ToDeadline(int64_t due_100ns);        // relative or absolute to a steady clock deadline in ns
 void QueueDpc(uint32_t dpc, uint32_t arg1, uint32_t arg2);
 struct Thread;
@@ -204,7 +207,7 @@ private:
 void NameHostThread(const char* name);  // the calling host thread, as debuggers and profilers list it
 void RunDpcs(X86Context& ctx);
 void InitKernelData();
-void LogGuestStack(X86Context& ctx, int words);
+void LogGuestStack(X86Context& ctx, int words, bool diag = false);  // diag: for a report, not marked as an error
 ThreadRef CreateThread(uint32_t stack_size, uint32_t tls_size, uint32_t system_routine, uint32_t start_routine,
                        uint32_t start_context, bool suspended);
 void StartThread(ThreadRef t);
@@ -218,6 +221,8 @@ std::vector<ThreadRef> Threads();
 
 // files
 void MountDefaults(const std::string& game_dir, const std::string& data_dir);
+void LogRecentFiles();
+uint64_t TakeReadNs();  // nanoseconds the title's file reads took since the last take (a hitch report); any thread  // the title's last file opens and reads, as errors, for a hang report
 bool CreateSymbolicLink(const std::string& link, const std::string& target);
 bool DeleteSymbolicLink(const std::string& link);
 std::string QuerySymbolicLink(const std::string& link);

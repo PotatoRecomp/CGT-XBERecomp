@@ -19,6 +19,7 @@
 #include <unordered_set>
 #include <vector>
 
+#include "common/options.h"
 #include "core/diag.h"
 #include "core/log.h"
 #include "gpu/backend.h"
@@ -396,7 +397,9 @@ private:
                 b = queue_.front();
                 queue_.pop_front();
             }
+            batch_start_ = Clock::now();
             for (const Cmd& c : b->cmds) Execute(*b, c);
+            frame_busy_ms_ += std::chrono::duration<double, std::milli>(Clock::now() - batch_start_).count();
             uint64_t id = b->id;
             b->cmds.clear();
             b->bytes.clear();
@@ -414,6 +417,24 @@ private:
         done_cv_.notify_all();
     }
 
+    // Frame skip, as in the Def Jam port: while this thread is behind, the next frame's state is taken but its draws,
+    // clears and present are not, and the picture catches up with the game. Behind is this thread's working time over
+    // the game's frame time, its waits for the title left out: a skipped frame costs little and pays the debt back. At
+    // most kMaxSkips in a row, so the screen keeps moving. A movie or menu is cheap and never behind, so never skipped
+    void PlanNextFrame() {
+        constexpr int kMaxSkips = 2;
+        auto now = Clock::now();
+        double budget = 1000.0 / (game::Opt().frame_rate_60 ? 60 : 30);
+        // the work since the last present: the batches finished since, and this one so far
+        double ms = frame_busy_ms_ + std::chrono::duration<double, std::milli>(now - batch_start_).count();
+        frame_busy_ms_ = 0;
+        batch_start_ = now;
+        late_ms_ = std::clamp(late_ms_ + ms - budget, 0.0, budget * 4);
+        bool skip = game::Opt().frame_skip && !g_capture.load() && late_ms_ > budget * 0.5 && skips_ < kMaxSkips;
+        skips_ = skip ? skips_ + 1 : 0;
+        skipping_ = skip;
+    }
+
     void Execute(const Batch& b, const Cmd& c) {
         const uint8_t* data = b.bytes.data() + c.data;
         switch (c.op) {
@@ -429,10 +450,19 @@ private:
                 if (c.ps >= 0) state_.ps = b.ps[size_t(c.ps)];
                 break;
             }
-            case Op::Draw: inner_->Draw(state_, c.a, c.b, c.c, c.d ? data : nullptr); break;
-            case Op::Clear: inner_->Clear(state_, c.a, c.size ? data : nullptr, c.b, c.c, c.f, c.d); break;
+            case Op::Draw:
+                // a skipped frame keeps its visibility tests: the game reads them back for its light glows
+                if (!skipping_ || state_.simple[kMCountEnable >> 2])
+                    inner_->Draw(state_, c.a, c.b, c.c, c.d ? data : nullptr);
+                break;
+            case Op::Clear:
+                if (!skipping_) inner_->Clear(state_, c.a, c.size ? data : nullptr, c.b, c.c, c.f, c.d);
+                break;
             case Op::Copy: inner_->Copy(c.s1, c.s2, c.a, c.b, c.c); break;
-            case Op::Present: inner_->Present(c.s1); break;
+            case Op::Present:
+                if (!skipping_) inner_->Present(c.s1);
+                PlanNextFrame();
+                break;
             case Op::Sync: inner_->Sync(c.a, 0); break;
             case Op::RecordLate: inner_->RecordLate(c.a); break;
             case Op::Flush: inner_->Flush(); break;
@@ -444,6 +474,11 @@ private:
 
     std::unique_ptr<Backend> inner_;
     std::vector<Range> ranges_;
+    bool skipping_ = false;                         // this frame's draws and present left out (PlanNextFrame)
+    int skips_ = 0;                                 // frames left out in a row
+    double late_ms_ = 0;                            // how far behind the game's frame rate the drawing is
+    double frame_busy_ms_ = 0;                      // working time of this frame's batches done so far
+    Clock::time_point batch_start_ = Clock::now();  // the batch being executed
 
     // the title's thread
     struct HeaderCopy {

@@ -171,6 +171,9 @@ void Rows() {
     if (OptionRow("GAME FRAME RATE", o.frame_rate_60 ? "60" : "30 (CONSOLE)",
                   "The game paces itself at 30 like the console; 60 runs it twice as smooth at the same speed."))
         o.frame_rate_60 = !o.frame_rate_60;
+    if (OptionRow("FRAME SKIP", OnOff(o.frame_skip),
+                  "While the drawing falls behind, frames are left undrawn so the picture keeps up with the game."))
+        o.frame_skip = !o.frame_skip;
     {
         char text[16];
         std::snprintf(text, sizeof text, "%u%%", s.render_percent);
@@ -194,6 +197,7 @@ void Rows() {
     }
     if (OptionRow("BLOOM", OnOff(o.bloom))) o.bloom = !o.bloom;
     if (OptionRow("FOG", OnOff(o.fog))) o.fog = !o.fog;
+    if (OptionRow("SHADOWS", OnOff(o.shadows), "The shadow the room's main light casts.")) o.shadows = !o.shadows;
     if (game::g_hdr_display.load() || o.hdr_output) {
         if (OptionRow("HDR OUTPUT", OnOff(o.hdr_output), "HDR10 on a display with HDR turned on.")) o.hdr_output = !o.hdr_output;
     }

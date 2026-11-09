@@ -72,22 +72,23 @@ void Write(Level lv, const char* fmt, ...) {
     std::vsnprintf(msg, sizeof(msg), fmt, ap);
     va_end(ap);
     double t = std::chrono::duration<double>(std::chrono::steady_clock::now() - g_start).count();
-    static const char* names[] = {"debug", "info", "warn", "error", "info"};
+    static const char* names[] = {"debug", "info", "warn", "error", "info", "diag"};
     auto tid = std::hash<std::thread::id>()(std::this_thread::get_id()) & 0xFFFF;
     std::lock_guard<std::mutex> lock(g_mutex);
     char line[4300];
     int n = kVerbose ? std::snprintf(line, sizeof(line), "[%9.3f] [%s] [t%04zx] %s\n", t, names[int(lv)], size_t(tid), msg)
                      : std::snprintf(line, sizeof(line), "[%9.3f] %s%s\n", t, lv == Level::Error ? "error: " : "", msg);
     n = std::min(n, int(sizeof(line)) - 1);
-    if (lv == Level::Error && !g_error_path.empty()) {
-        // the first error opens the error file in place of the log the run had
+    const bool kept = lv == Level::Error || lv == Level::Diag;  // what ErrorFile's log takes
+    if (kept && !g_error_path.empty()) {
+        // the first error or Diag line opens the error file in place of the log the run had
         if (g_file) std::fclose(g_file);
         g_file = std::fopen(g_error_path.c_str(), "w");
         if (g_file) std::fputs(g_error_header.c_str(), g_file);
         g_path = g_error_path;
         g_error_path.clear();
     }
-    if (g_file && (!g_errors_only || lv == Level::Error)) {
+    if (g_file && (!g_errors_only || kept)) {
         std::fwrite(line, 1, size_t(n), g_file);
         if (lv >= Level::Warn) std::fflush(g_file);
     }

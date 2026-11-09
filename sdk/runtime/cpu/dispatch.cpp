@@ -208,14 +208,15 @@ uint32_t CallGuest(X86Context& ctx, uint32_t fn, const uint32_t* args, size_t co
 
 namespace kernel {
 // return addresses found on the guest stack, the cheapest way to place a guest event
-void LogGuestStack(X86Context& ctx, int words) {
-    LOGE("  eax %08X ecx %08X edx %08X ebx %08X esp %08X ebp %08X esi %08X edi %08X", ctx.eax, ctx.ecx, ctx.edx, ctx.ebx,
-         ctx.esp, ctx.ebp, ctx.esi, ctx.edi);
+void LogGuestStack(X86Context& ctx, int words, bool diag) {
+    const logx::Level lv = diag ? logx::Level::Diag : logx::Level::Error;
+    logx::Write(lv, "  eax %08X ecx %08X edx %08X ebx %08X esp %08X ebp %08X esi %08X edi %08X", ctx.eax, ctx.ecx,
+                ctx.edx, ctx.ebx, ctx.esp, ctx.ebp, ctx.esi, ctx.edi);
     for (int i = 0; i < words; i++) {
         uint32_t a = ctx.esp + uint32_t(i) * 4;
         if (!mem::IsCommitted(a)) break;
         uint32_t v = R32(a);
-        if (dispatch::InCode(v)) LOGE("  [esp+%03X] %08X", i * 4, v);
+        if (dispatch::InCode(v)) logx::Write(lv, "  [esp+%03X] %08X", i * 4, v);
     }
 }
 }  // namespace kernel

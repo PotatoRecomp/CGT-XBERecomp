@@ -5,10 +5,12 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <deque>
 #include <filesystem>
 #include <memory>
 #include <mutex>
@@ -20,6 +22,8 @@
 #include <unordered_set>
 #include <utility>
 #include <vector>
+
+#include <sys/resource.h>
 
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_vulkan.h>
@@ -66,6 +70,7 @@ PFN_vkWaitSemaphoresKHR p_vkWaitSemaphores = nullptr;
 #include "gpu/texture.h"
 #include "gpu/vertex.h"
 #include "host.h"
+#include "audio/audio.h"
 #include "kernel/kernel.h"
 #include "vk_shader.h"
 
@@ -133,6 +138,7 @@ struct Perf {
     uint64_t shaders = 0;
     uint64_t raw = 0;
     uint64_t lates = 0;
+    uint64_t deferred = 0;  // draws left out while their shader or pipeline is made off the thread (ASYNC SHADERS)
 };
 Perf g_perf;
 struct PerfScope {
@@ -146,6 +152,57 @@ bool CaptureOn() {
     if (diag::CaptureDir().empty()) LOG_FIRST(1, "capture: set XBE_CAPTURE_DIR");
     return !diag::CaptureDir().empty();
 }
+
+// Cracks: a slit under one console pixel wide between two surfaces, through which a pixel sees something much
+// farther than both. The game's art has such slits: in the first mission a door's edge face and its frame's
+// jamb leave one, and through it the next room shows fully fogged, the tan fog colour, as a line wherever a pixel
+// centre falls in it; drawn larger than the console's 640x480 it shows on nearly every row. Such a pixel takes the
+// colour of the surfaces either side; every other pixel is left as it was.
+// opt: x most host pixels a crack spans. A perspective depth's 1 - d goes as 1 / distance, so a side a fifth nearer
+// has a 1 - d a fifth larger, with no projection needed. The two sides need not match: the slit is there whatever is
+// in front of one side (the player standing by a door)
+const char* kCrackHlsl = R"(
+cbuffer P : register(b1) { float4 opt; float4 opt2; };
+Texture2D<float4> img : register(t0);
+Texture2D<float> depth : register(t1);
+struct O { float4 p : SV_Position; float2 uv : TEXCOORD0; };
+O vs(uint id : SV_VertexID) {
+    O o;
+    o.uv = float2((id << 1) & 2, id & 2);
+    o.p = float4(o.uv * float2(2, -2) + float2(-1, 1), 0, 1);
+    return o;
+}
+float4 fill(O i) : SV_Target {
+    int2 p = int2(i.p.xy);
+    uint w, h;
+    img.GetDimensions(w, h);
+    float4 c = img.Load(int3(p, 0));
+    // 1 - depth goes as 1 / distance: a side is nearer than this pixel by a fifth or more
+    float ic = 1 - depth.Load(int3(p, 0));
+    float nearer = ic * 1.2 + 1e-6;
+    int n = int(opt.x);
+    [unroll] for (int axis = 0; axis < 2; axis++) {
+        int2 step = axis == 0 ? int2(1, 0) : int2(0, 1);
+        int lo = 0, hi = 0;
+        [loop] for (int k = 1; k <= n; k++) {
+            int2 q = p - step * k;
+            if (q.x < 0 || q.y < 0) break;
+            float d = depth.Load(int3(q, 0));
+            if (1 - d > nearer) { lo = k; break; }
+        }
+        [loop] for (int k = 1; k <= n; k++) {
+            int2 q = p + step * k;
+            if (q.x >= int(w) || q.y >= int(h)) break;
+            float d = depth.Load(int3(q, 0));
+            if (1 - d > nearer) { hi = k; break; }
+        }
+        if (lo == 0 || hi == 0 || lo + hi - 1 > n) continue;
+        float4 a = img.Load(int3(p - step * lo, 0)), b = img.Load(int3(p + step * hi, 0));
+        return lerp(a, b, float(lo) / float(lo + hi));
+    }
+    return c;
+}
+)";
 
 const char* kBlitHlsl = R"(
 cbuffer B : register(b1) { float4 uvrect; float4 opts; };
@@ -835,6 +892,7 @@ struct Target {
     VkFormat fmt = kBgra;
     float range = 1;  // colour held divided by it
     bool swizzled = false;  // the surface's memory is in Morton order: Sync writes it so, and keeps no read copy
+    uint32_t depth_data = 0;  // a colour target: the depth buffer it last rendered with (BindTargets)
 };
 
 // MemSig hashes a surface up to kSigWholeMax bytes whole, a bigger one as evenly spaced samples
@@ -842,17 +900,22 @@ constexpr uint32_t kSigWholeMax = 65536;
 constexpr uint32_t kSigSamples = 64;
 constexpr uint32_t kSigSampleBytes = 64;
 
-uint64_t MemSig(uint32_t data, uint32_t total) {
+// MemSig's hash alone: DeliverLate runs on the title's thread, and g_perf is the render thread's
+uint64_t GuestSig(uint32_t data, uint32_t total) {
     const uint8_t* p = static_cast<const uint8_t*>(kernel::HostPtr(data));
     uint64_t sig = Hash(&total, sizeof(total));
-    g_perf.sigs++;
-    g_perf.sig_bytes += total <= kSigWholeMax ? total : kSigSamples * kSigSampleBytes;
     if (total <= kSigWholeMax) return Hash(p, total, sig);
     for (uint32_t i = 0; i < kSigSamples; i++) {
         const uint8_t* sample = p + uint64_t(total - kSigSampleBytes) * i / (kSigSamples - 1);
         sig = Hash(sample, kSigSampleBytes, sig);
     }
     return sig;
+}
+
+uint64_t MemSig(uint32_t data, uint32_t total) {
+    g_perf.sigs++;
+    g_perf.sig_bytes += total <= kSigWholeMax ? total : kSigSamples * kSigSampleBytes;
+    return GuestSig(data, total);
 }
 
 // MemSig samples a big surface and misses small writes (XFONT text): after a Sync every byte is compared
@@ -1050,11 +1113,37 @@ public:
     void WaitGpuFrame(uint64_t n);
 
 private:
+    // GPU breadcrumbs. A Mali GPU that faults on a draw (a read outside its buffer) drops the rest of the submission
+    // without a word to Vulkan: the fence signals, the swap chain image keeps what it held, and the screen shows old
+    // frames. Each submission writes its number into a small buffer when it begins and again when its last command
+    // is done; a submission whose end never landed is written up in cgt.log. After one, each pass also writes how
+    // many passes are done, and the passes' draws are noted, so the report names the pass and draws it stopped in
+    struct DrawNote {
+        uint32_t rt = 0, vs = 0, prim = 0, count = 0, tex0 = 0;  // prim 0: one of the renderer's own full screen passes
+        uint32_t vbytes = 0, indices = 0, draws = 0;
+        uint64_t pso = 0;
+    };
+    struct PassNote {
+        uint32_t rt = 0, w = 0, h = 0, format = 0, samples = 0;
+        bool depth = false;
+        std::vector<DrawNote> draws;
+    };
+    struct Crumbs {
+        BufferRef buf;            // uint32: [0] begun, [1] finished, [2] passes done
+        uint32_t seq = 0;         // this submission's number, 0 when there is none to check
+        bool detail = false;      // passes counted and noted
+        uint32_t passes = 0;
+        uint64_t overflow_at = 0, overflows = 0, used = 0;  // the upload ring, which a big frame overflows
+        std::vector<PassNote> notes;
+    };
     struct Frame {
+        Crumbs crumbs;
         VkCommandPool pool = VK_NULL_HANDLE;
         VkCommandBuffer cmd = VK_NULL_HANDLE;
         VkCommandBuffer pre = VK_NULL_HANDLE;  // a new texture's first upload, submitted ahead of cmd
         bool pre_open = false;
+        std::vector<VkCommandBuffer> passes;  // each pass's draws (EnsureRendering), reused frame after frame
+        size_t pass_at = 0;
         BufferRef upload;
         uint64_t used = 0;
         uint64_t fence = 0;
@@ -1088,6 +1177,12 @@ private:
     void SetAttachments(Image* color, Image* depth, VkAttachmentLoadOp load = VK_ATTACHMENT_LOAD_OP_LOAD);
     void EnsureRendering();
     void EndRendering();
+    // the open pass's draws reach pixels in r (Touch), or anywhere (TouchAll): its area grows to take them
+    void Touch(const VkRect2D& r);
+    void TouchAll();
+    void TouchScissor();
+    VkCommandBuffer NextPassBuffer();
+    void ReplayState();
     void HostReadBarrier();
     void SetViewport(float x, float y, float w, float h);
     void BindPipeline(VkPipeline pso);
@@ -1104,11 +1199,15 @@ private:
     void Submit(bool wait);
     void WaitFence(uint64_t value);
     VkFence SubmitFence(uint64_t value);
+    bool QueueSubmit(const VkSubmitInfo& si, uint64_t value);
     void PollFences();
     void ResetPools(Frame& f);
     VkDescriptorSet AllocateSet();
     VkRenderPass CompatiblePass(VkFormat color, VkFormat depth, uint32_t samples,
                                 VkAttachmentLoadOp load = VK_ATTACHMENT_LOAD_OP_LOAD);
+    // a render pass with each aspect's own load op, as a recorded pass begins (EndRendering)
+    VkRenderPass RenderPassFor(VkFormat color, VkFormat depth, uint32_t samples, VkAttachmentLoadOp color_load,
+                               VkAttachmentLoadOp depth_load, VkAttachmentLoadOp stencil_load);
     VkFramebuffer Framebuffer(Image* color, Image* depth, uint32_t w, uint32_t h);
     void DropFramebuffers(VkImageView v);
     void CompletePipeline(PipelineParts& p);
@@ -1145,6 +1244,8 @@ private:
     VkPipeline CreatePassPipeline(const PassPipe& p);
     bool BindTargets(const State& s);
     bool DepthCopy(const State& s);
+    bool SkipShadow(const State& s);
+    void EndShadowFrame();
     bool DepthPass(Image* src, Image* dst, uint32_t w, uint32_t h);
     VkPipeline EnsureDepthCopyPipeline(bool ms, uint32_t samples);
     // one full screen pass of kAoHlsl
@@ -1208,7 +1309,8 @@ private:
     std::unordered_map<VkFormat, bool> linear_;
     void SetViewportScissor(const State& s, uint32_t gw);
     void SetBlendFactorStencilRef(const State& s, const PsoKey& k);
-    void DrawGeometry(const Assembled& a);
+    // bounds: the host pixels the draw can reach when known (ScreenBounds), else the scissor's
+    void DrawGeometry(const Assembled& a, const VkRect2D* bounds = nullptr);
     // shaders by source hash: Compile returns the module and sets hash
     VkShaderModule Compile(const std::string& src, const char* entry, const char* profile, uint64_t& hash);
     VkPipeline EnsureBlitPipeline(VkFormat rtv, bool over, uint32_t samples);
@@ -1234,6 +1336,7 @@ private:
     void UploadGammaRamp();
     void DrawFrame(Target* t, uint32_t bi);
     Image* PrepareShownFrame(Target* t);
+    void FillCracks(const State& s);
     Image* Smaa(Image* src, VkFormat fmt, uint32_t w, uint32_t h);
     struct SmaaLookup {
         VkFormat fmt;
@@ -1261,6 +1364,11 @@ private:
     void SubmitPresent(bool acquired, uint32_t bi);
     void ReleaseOldTextures();
     void ResetFrame();
+    void CrumbBegin();
+    void CrumbEnd();
+    void CrumbPass(bool executed);
+    void CrumbNote(const Assembled* a);
+    void CrumbCheck(Frame& f, const char* what);
     void CountFps();
     void ApplySettings();
     ImageRef Shrink(Image* src, uint32_t w, uint32_t h, const ShrinkOptions& o = {});
@@ -1286,7 +1394,8 @@ private:
         float z;
         uint32_t stencil;
     };
-    void ClearTarget(Target& t, const State& s, const ClearArgs& c, std::vector<VkClearRect>& rs);
+    void ClearTarget(Target& t, const State& s, const ClearArgs& c, std::vector<VkClearRect>& rs, Image* color,
+                     Image* depth);
     // Copy's guest lists: count src_rects, dst_points 0 or one per rect
     struct CopyList {
         uint32_t count;
@@ -1304,6 +1413,7 @@ private:
     // RecordLate's steps, under late_lock_
     struct Late;
     void ResetLate(Late& l, const Target& t);
+    bool CpuWrote(Target& t);
     Image* PrepareLateSource(Target& t, Late& l);
     void RecordLateCopy(Late& l, uint32_t slot, Image* src);
 
@@ -1346,6 +1456,8 @@ private:
     std::vector<Pending> pending_;
     std::vector<VkFence> spare_fences_;
     std::atomic<uint64_t> fenced_{0};  // the highest value whose fence signalled
+    // the GPU was lost (a submit failed with VK_ERROR_DEVICE_LOST): nothing it was given will signal, so no wait blocks
+    std::atomic<bool> device_lost_{false};
     std::unordered_map<uint64_t, VkRenderPass> passes_;
     struct Fb {
         VkImageView color, depth;
@@ -1366,7 +1478,24 @@ private:
     Image* att_color_ = nullptr;  // the attachments the next draw renders to
     VkAttachmentLoadOp att_load_ = VK_ATTACHMENT_LOAD_OP_LOAD;
     Image* att_depth_ = nullptr;
-    bool rendering_ = false;      // a vkCmdBeginRendering with them is open
+    bool rendering_ = false;      // a pass with them is being recorded (OpenPass)
+    // The pass being recorded. Its draws go to a secondary command buffer, and the pass itself is begun on the
+    // frame's command buffer when it ends, knowing what they did. A tiler loads and stores only the tiles inside a
+    // pass's render area: the glow test's quads and the restore of their patch, a few tiles of the frame, had the
+    // whole frame and its depth buffer read from memory and written back for each pass. And a clear of a whole
+    // attachment before anything is drawn becomes its load op, so what it held is never read only to be cleared.
+    struct OpenPass {
+        VkCommandBuffer frame = VK_NULL_HANDLE;  // the command buffer the pass is begun on
+        VkCommandBuffer draws = VK_NULL_HANDLE;
+        Image* color = nullptr;
+        Image* depth = nullptr;
+        VkAttachmentLoadOp load = VK_ATTACHMENT_LOAD_OP_LOAD;  // the colour's, as SetAttachments asked
+        uint32_t w = 0, h = 0;
+        int32_t x0 = 0, y0 = 0, x1 = 0, y1 = 0;  // the pixels reached so far, x1 <= x0 for none
+        bool drawn = false;  // a draw or clear is recorded: a whole clear after it is no longer a load op
+        bool clear_color = false, clear_depth = false, clear_stencil = false;
+        VkClearValue color_value{}, depth_value{};
+    } pass_;
     // What the command buffer has bound and set, so a draw sets only what changed: Mali's driver works over the
     // state dirtied since the last draw on every one, thousands a frame. ForgetState drops it all when something
     // else may have changed it (a new command buffer, ImGui's drawing).
@@ -1390,7 +1519,64 @@ private:
     VkPipelineCache pipeline_cache_ = VK_NULL_HANDLE;
     size_t pipeline_cache_saved_ = 0;
     void LoadShaderCaches();
-    void SaveShaderCaches();
+    void SaveShaderCaches();  // shutdown: on this thread, whatever changed
+    // Every draw pipeline's key, in the order the title first drew with it, kept in pipelines.bin: the next run makes
+    // them all again on a thread of its own while the title starts (StartWarmPipelines), so a draw never waits for
+    // its pipeline to be built. Built at its first draw, a pipeline is compiled for the GPU there and then (even from
+    // the driver's cache, a millisecond or more on Mali), and a new area or a burst of new effects held its frame for
+    // tens of them. Render thread
+    std::vector<PsoKey> pso_keys_;
+    std::unordered_set<uint64_t> pso_known_;  // their hashes
+    size_t pso_keys_saved_ = 0;
+    // the warm thread's pipelines not yet taken, and what the render thread built itself meanwhile, which the warm
+    // thread then leaves out
+    std::mutex warm_lock_;
+    std::unordered_map<uint64_t, VkPipeline> warm_;
+    std::unordered_set<uint64_t> built_;
+    std::thread warm_thread_;
+    std::atomic<bool> warm_stop_{false};
+    // ASYNC SHADERS: a shader or pipeline the frame's own target meets for the first time is made on a thread of its
+    // own (AsyncBuild) and the draw left out until it is there, a few frames, rather than the frame held while Mali
+    // builds it (60 to 120 ms a pipeline on a Mali-G57, a burst of an effect's first sight half a second)
+    struct AsyncJob {
+        bool pipeline = false;
+        std::string src;  // a shader's HLSL, its entry and stage
+        std::string entry;
+        bool vertex = false;
+        uint64_t hash = 0;  // the shader's, or the pipeline key's
+        PsoKey key{};
+        VkShaderModule vs = VK_NULL_HANDLE, ps = VK_NULL_HANDLE;
+    };
+    void QueueAsync(AsyncJob job);
+    void AsyncBuild();
+    std::thread async_thread_;
+    std::mutex async_lock_;
+    std::condition_variable async_cv_;
+    std::deque<AsyncJob> async_jobs_;
+    std::unordered_set<uint64_t> async_pending_;  // queued or being made, shaders and pipelines alike
+    bool async_stop_ = false;
+    // the surfaces the last presents showed: the frame's own targets, drawn every frame. Several, as the title swaps
+    // between its back buffers: the one a frame draws to is never the one the present just before it showed
+    std::array<uint32_t, kFrames> shown_data_{};
+    uint32_t shown_at_ = 0;
+    bool async_draw_ = false;  // the draw being made goes to one, so it may wait for what it needs
+    // this frame so far, for the frame history (LogFrameHistory)
+    uint32_t frame_draws_ = 0, frame_shown_draws_ = 0, frame_skips_ = 0;
+    // breadcrumbs (Crumbs): submissions numbered, presents left with passes counted, reports written, the draw going
+    uint32_t crumb_seq_ = 0, crumb_detail_ = 0, crumb_reports_ = 0, crumb_drops_ = 0;
+    DrawNote crumb_draw_;
+    uint64_t frame_view_ = 0, frame_consts_ = 0;  // the camera's transforms, the first shown-target draw's c0-c7
+    bool Shown(uint32_t data) const {
+        return data && std::find(shown_data_.begin(), shown_data_.end(), data) != shown_data_.end();
+    }
+    void StartWarmPipelines();
+    VkPipeline CreateDrawPipeline(const PsoKey& k, VkShaderModule vs, VkShaderModule ps);  // any thread
+    // the pipeline cache and the keys written by a thread of their own when pipelines were made since the last time:
+    // serialized by the driver and written to flash on the render thread, it held the frame that made them longer
+    std::thread save_thread_;
+    std::atomic<bool> saving_{false};
+    void SaveCachesInBackground();
+    std::mutex pass_lock_;  // passes_: the warm thread completes pipelines with render passes too
     std::unordered_map<uint64_t, uint64_t> shader_src_;  // vertex and pixel program keys to source hash
     std::unordered_map<uint64_t, VkPipeline> psos_;
     PsoKey last_pso_key_{};  // the last pipeline EnsurePipeline found, by its whole key
@@ -1426,6 +1612,17 @@ private:
     uint32_t bb_w_ = 0;
     uint32_t bb_h_ = 0;
     float scale_ = 1.0f;
+    std::unordered_set<uint64_t> shadow_maps_;  // targets_ keys of the game's shadow maps (SkipShadow)
+    uint32_t shadow_light_ = 0;   // this frame's lights whose shadows began so far
+    bool in_shadow_map_ = false;  // the last draw or clear went to a shadow map
+    // for FillCracks, by colour surface (physical): the depth surface its depth writing draws used and their frame
+    struct SceneDepth {
+        Surface zs;
+        uint64_t frame;
+    };
+    std::unordered_map<uint32_t, SceneDepth> scene_depth_;
+    ImageRef crack_;              // the scene's target copied aside for FillCracks
+    uint64_t crack_frame_ = UINT64_MAX;  // the frame FillCracks last ran in
     uint32_t msaa_ = 1;      // samples in use
     uint32_t msaa_set_ = 0;  // the setting they came from
     // ambient occlusion: the raw pass and its first blur, each with view z beside it
@@ -1440,6 +1637,8 @@ private:
         uint64_t fence[kFrames] = {};
         uint64_t frame[kFrames] = {};
         uint64_t delivered = 0;
+        uint64_t delivered_sig = 0;  // GuestSig of the copy DeliverLate last wrote to guest memory, 0 for none
+        uint32_t bytes = 0;          // the target's guest bytes, what GuestSig hashes
         uint32_t gw = 0;
         uint32_t gh = 0;
         uint32_t next = 0;
@@ -1473,9 +1672,19 @@ private:
 
 
 VulkanBackend::~VulkanBackend() {
+    warm_stop_ = true;
+    if (warm_thread_.joinable()) warm_thread_.join();
+    {
+        std::lock_guard lock(async_lock_);
+        async_stop_ = true;
+    }
+    async_cv_.notify_all();
+    if (async_thread_.joinable()) async_thread_.join();
+    if (save_thread_.joinable()) save_thread_.join();
     if (dev_) {
         vkDeviceWaitIdle(dev_);
         SaveShaderCaches();
+        for (auto& [h, pso] : warm_) vkDestroyPipeline(dev_, pso, nullptr);
     }
 }
 
@@ -1518,6 +1727,8 @@ bool VulkanBackend::Init(uint32_t width, uint32_t height) {
     if (!swapchain) return fail("no swap chain");
     if (!InitUi()) return fail("no UI");
     LoadSettings();
+    StartWarmPipelines();
+    async_thread_ = std::thread([this] { AsyncBuild(); });
     LOGI("vulkan: %ux%u guest, %ux%u window, render scale %.3f", width, height, bb_w_, bb_h_, scale_);
     return true;
 }
@@ -1636,6 +1847,7 @@ bool VulkanBackend::PickDevice() {
     // 00582558) has neither dynamic rendering nor 1.2: render passes and fences there; its menus' text draws as
     // black boxes, not yet understood
     if (props_.vendorID == kVendorImgTec) LOGR("vulkan: PowerVR");
+    host::SetGpuName(props_.deviceName);
     LOGR("GPU: %s (Vulkan %u.%u.%u, driver %08X)", props_.deviceName, VK_API_VERSION_MAJOR(props_.apiVersion),
          VK_API_VERSION_MINOR(props_.apiVersion), VK_API_VERSION_PATCH(props_.apiVersion), props_.driverVersion);
     // reported, not warned: release logs drop warnings and these are what a bug report needs
@@ -1665,6 +1877,12 @@ bool VulkanBackend::CreateDevice() {
     VkPhysicalDeviceFeatures have{};
     vkGetPhysicalDeviceFeatures(phys_, &have);
     VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+    // Reads past a bound buffer give zeros or a value from inside it, rather than whatever lies past the memory. A
+    // Mali GPU that reads past the allocation faults, and its driver drops the rest of the submission without telling
+    // Vulkan: the frame's picture never reaches its swap chain image, which goes back on screen as it was. Without
+    // extended dynamic state (Mali) the vertex buffers are bound with no size, so a draw over-reading an upload of its
+    // own (one too big for the ring) is past the allocation. Required of every Vulkan 1.0 device
+    f2.features.robustBufferAccess = have.robustBufferAccess;
     f2.features.samplerAnisotropy = have.samplerAnisotropy;
     f2.features.fillModeNonSolid = have.fillModeNonSolid;
     f2.features.depthClamp = have.depthClamp;
@@ -1808,6 +2026,18 @@ bool VulkanBackend::CreateDevice() {
 
 namespace {
 std::filesystem::path PipelineFile() { return host::FilesDir() / "pipelinecache.bin"; }
+std::filesystem::path PipelineKeysFile() { return host::FilesDir() / "pipelines.bin"; }
+
+// pipelines.bin: this header, then the keys. Another build's keys are another size or layout: dropped, made again as
+// the title draws. A key from the same layout is made by this build's code, so it is the pipeline that draw needs
+struct PipelineKeysHeader {
+    uint32_t magic = 0x50534B43;  // "CKSP"
+    uint32_t version = 1;
+    uint32_t key_size = sizeof(PsoKey);
+    uint32_t depth_format = 0;
+    uint32_t dynamic = 0;  // the device's dynamic state and rendering: the pipelines differ without them
+    uint32_t count = 0;
+};
 
 std::vector<uint8_t> ReadAll(const std::filesystem::path& path) {
     std::vector<uint8_t> data;
@@ -1853,7 +2083,20 @@ void VulkanBackend::LoadShaderCaches() {
     LOGR("vulkan: pipeline cache %zu KB", p.size() / 1024);
 }
 
+static void WritePipelineKeys(const std::vector<PsoKey>& keys, PipelineKeysHeader h) {
+    h.count = uint32_t(keys.size());
+    std::vector<uint8_t> d(sizeof(h) + keys.size() * sizeof(PsoKey));
+    std::memcpy(d.data(), &h, sizeof(h));
+    if (!keys.empty()) std::memcpy(d.data() + sizeof(h), keys.data(), keys.size() * sizeof(PsoKey));
+    WriteAll(PipelineKeysFile(), d.data(), d.size());
+}
+
 void VulkanBackend::SaveShaderCaches() {
+    if (pso_keys_.size() != pso_keys_saved_) {
+        WritePipelineKeys(pso_keys_, {.depth_format = uint32_t(depth_fmt_),
+                                      .dynamic = uint32_t(dynamic_state_) | uint32_t(dynamic_rendering_) << 1});
+        pso_keys_saved_ = pso_keys_.size();
+    }
     if (pipeline_cache_) {
         size_t n = 0;
         vkGetPipelineCacheData(dev_, pipeline_cache_, &n, nullptr);
@@ -1863,6 +2106,134 @@ void VulkanBackend::SaveShaderCaches() {
                 WriteAll(PipelineFile(), d.data(), n);
                 pipeline_cache_saved_ = n;
             }
+        }
+    }
+}
+
+// Render thread, every 600 presents: when the title met pipelines since the last save, the keys and the driver's cache
+// are written by a thread of their own. The driver's cache takes pipelines from other threads while it is read (it is
+// not created externally synchronized), and the keys go as they are now: a later one waits for the next save
+void VulkanBackend::SaveCachesInBackground() {
+    if (pso_keys_.size() == pso_keys_saved_ || saving_) return;
+    if (save_thread_.joinable()) save_thread_.join();  // done: saving_ is cleared last
+    saving_ = true;
+    pso_keys_saved_ = pso_keys_.size();
+    PipelineKeysHeader h{.depth_format = uint32_t(depth_fmt_),
+                         .dynamic = uint32_t(dynamic_state_) | uint32_t(dynamic_rendering_) << 1};
+    save_thread_ = std::thread([this, keys = pso_keys_, h] {
+        WritePipelineKeys(keys, h);
+        size_t n = 0;
+        if (pipeline_cache_ && vkGetPipelineCacheData(dev_, pipeline_cache_, &n, nullptr) == VK_SUCCESS && n) {
+            std::vector<uint8_t> d(n);
+            if (vkGetPipelineCacheData(dev_, pipeline_cache_, &n, d.data()) == VK_SUCCESS) {
+                WriteAll(PipelineFile(), d.data(), n);
+                pipeline_cache_saved_ = n;
+            }
+        }
+        saving_ = false;
+    });
+}
+
+// The pipelines of the runs before, made again while the title starts, on a thread below the game's own in priority.
+// A draw that comes first takes its pipeline from warm_, or builds it itself when the thread has not reached it yet
+void VulkanBackend::StartWarmPipelines() {
+    std::vector<uint8_t> d = ReadAll(PipelineKeysFile());
+    PipelineKeysHeader want{.depth_format = uint32_t(depth_fmt_),
+                            .dynamic = uint32_t(dynamic_state_) | uint32_t(dynamic_rendering_) << 1};
+    PipelineKeysHeader h{};
+    if (d.size() >= sizeof(h)) std::memcpy(&h, d.data(), sizeof(h));
+    if (d.size() < sizeof(h) || h.magic != want.magic || h.version != want.version || h.key_size != want.key_size ||
+        h.depth_format != want.depth_format || h.dynamic != want.dynamic ||
+        d.size() < sizeof(h) + size_t(h.count) * sizeof(PsoKey)) {
+        LOGR("vulkan: no pipelines from earlier runs");
+        return;
+    }
+    std::vector<PsoKey> keys(h.count);
+    if (h.count) std::memcpy(keys.data(), d.data() + sizeof(h), keys.size() * sizeof(PsoKey));
+    for (const PsoKey& k : keys)
+        if (pso_known_.insert(Hash(&k, sizeof(k))).second) pso_keys_.push_back(k);
+    pso_keys_saved_ = pso_keys_.size();
+    LOGR("vulkan: making %zu pipelines from earlier runs", pso_keys_.size());
+    warm_thread_ = std::thread([this, keys = pso_keys_] {
+        setpriority(PRIO_PROCESS, 0, 10);  // this thread: the title's start and its first frames go first
+        auto start = std::chrono::steady_clock::now();
+        size_t made = 0;
+        auto module = [&](uint64_t hash) {
+            std::vector<uint32_t> spirv;
+            if (!vkshader::Cached(hash, spirv)) return VkShaderModule(VK_NULL_HANDLE);
+            VkShaderModuleCreateInfo mi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+            mi.codeSize = spirv.size() * sizeof(uint32_t);
+            mi.pCode = spirv.data();
+            VkShaderModule m = VK_NULL_HANDLE;
+            return vkCreateShaderModule(dev_, &mi, nullptr, &m) == VK_SUCCESS ? m : VK_NULL_HANDLE;
+        };
+        for (const PsoKey& k : keys) {
+            if (warm_stop_) break;
+            const uint64_t h = Hash(&k, sizeof(k));
+            {
+                std::lock_guard lock(warm_lock_);
+                if (built_.count(h)) continue;
+            }
+            VkShaderModule vs = module(k.vs), ps = module(k.ps);
+            VkPipeline pso = vs && ps ? CreateDrawPipeline(k, vs, ps) : VK_NULL_HANDLE;
+            if (vs) vkDestroyShaderModule(dev_, vs, nullptr);  // a pipeline keeps what it was made from
+            if (ps) vkDestroyShaderModule(dev_, ps, nullptr);
+            if (!pso) continue;
+            std::lock_guard lock(warm_lock_);
+            if (built_.count(h) || warm_.count(h)) {
+                vkDestroyPipeline(dev_, pso, nullptr);
+                continue;
+            }
+            warm_.emplace(h, pso);
+            made++;
+        }
+        LOGR("vulkan: %zu pipelines from earlier runs made in %.1f s", made,
+             std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count());
+    });
+}
+
+// Render thread: a job for the async thread, once while it is queued or being made
+void VulkanBackend::QueueAsync(AsyncJob job) {
+    {
+        std::lock_guard lock(async_lock_);
+        if (!async_pending_.insert(job.hash).second) return;
+        async_jobs_.push_back(std::move(job));
+    }
+    async_cv_.notify_one();
+}
+
+// The async thread, below the game's in priority: a shader goes to SPIR-V and the disk cache, where the render
+// thread's next try finds it; a pipeline goes to warm_, where EnsurePipeline looks before it builds
+void VulkanBackend::AsyncBuild() {
+    setpriority(PRIO_PROCESS, 0, 5);
+    for (;;) {
+        AsyncJob job;
+        {
+            std::unique_lock lock(async_lock_);
+            async_cv_.wait(lock, [&] { return async_stop_ || !async_jobs_.empty(); });
+            if (async_stop_) return;
+            job = std::move(async_jobs_.front());
+            async_jobs_.pop_front();
+        }
+        bool made = false;
+        if (job.pipeline) {
+            VkPipeline pso = CreateDrawPipeline(job.key, job.vs, job.ps);
+            if (pso) {
+                made = true;
+                std::lock_guard lock(warm_lock_);
+                if (warm_.count(job.hash)) vkDestroyPipeline(dev_, pso, nullptr);
+                else warm_.emplace(job.hash, pso);
+            }
+        } else {
+            std::vector<uint32_t> spirv;
+            made = vkshader::Compile(job.src, job.entry.c_str(),
+                                     job.vertex ? vkshader::Stage::Vertex : vkshader::Stage::Fragment, job.hash, spirv);
+        }
+        // what failed stays pending: its draws stay out, as a failure made on the render thread leaves them, rather
+        // than tried again each frame
+        if (made) {
+            std::lock_guard lock(async_lock_);
+            async_pending_.erase(job.hash);
         }
     }
 }
@@ -1910,6 +2281,7 @@ void VulkanBackend::CreateFrames() {
     VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     vkBeginCommandBuffer(cl_, &bi);
+    CrumbBegin();
 }
 
 // the gamma ramp as a 256 x 1 lookup, and the textures a stage without one reads
@@ -2078,20 +2450,55 @@ VulkanBackend::Alloc VulkanBackend::Upload(uint64_t size, uint64_t align) {
     return {b->buffer, 0, b->map};
 }
 
-// every layout change waits for all earlier work, as D3D12's transitions between states do
+// The stages and accesses an image is used with in a layout: as a barrier's source, what was done to it there; as
+// its destination, what will be. Each image is only ever used as its layout says (attachments drawn to, textures read
+// by pixel shaders, the Xbox having no vertex texture fetch, copies), so a layout change waits for exactly that work.
+// Waiting for all of it, every render to texture kept the next pass's vertex work from starting until the last pass's
+// pixels were done, and a tiler that overlaps the two sat half idle at each of the frame's dozens of transitions.
+struct LayoutUse {
+    VkPipelineStageFlags stages;
+    VkAccessFlags access;
+};
+
+LayoutUse UseOf(VkImageLayout layout) {
+    switch (layout) {
+        case VK_IMAGE_LAYOUT_UNDEFINED:
+        case VK_IMAGE_LAYOUT_PRESENT_SRC_KHR:
+            // nothing to keep; the stages a frame's submit waits for its swap chain image at, which this chains to
+            return {VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT, 0};
+        case VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL:
+            return {VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                    VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT};
+        case VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL:
+            return {VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
+                    VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT};
+        case VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL:
+            return {VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT};
+        case VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL:
+            return {VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT};
+        case VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL:
+            return {VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT};
+        default:
+            return {VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT};
+    }
+}
+
+constexpr VkAccessFlags kWrites = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT |
+                                  VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+
 void VulkanBackend::Transition(Image& img, VkImageLayout want) {
     if (img.layout == want) return;
     EndRendering();
+    const LayoutUse from = UseOf(img.layout), to = UseOf(want);
     VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
-    b.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
-    b.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+    b.srcAccessMask = from.access & kWrites;  // reads leave nothing to make visible: waiting for them is enough
+    b.dstAccessMask = to.access;
     b.oldLayout = img.layout;
     b.newLayout = want;
     b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     b.image = img.image;
     b.subresourceRange = {img.aspect, 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS};
-    vkCmdPipelineBarrier(cl_, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0,
-                         nullptr, 1, &b);
+    vkCmdPipelineBarrier(cl_, from.stages, to.stages, 0, 0, nullptr, 0, nullptr, 1, &b);
     img.layout = want;
 }
 
@@ -2129,60 +2536,211 @@ void VulkanBackend::EnsureRendering() {
                                                        VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT |
                                                        VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
     vkCmdPipelineBarrier(cl_, kAttachmentStages, kAttachmentStages, 0, 1, &mb, 0, nullptr, 0, nullptr);
-    VkRenderingAttachmentInfo ca{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
-    VkRenderingAttachmentInfo da{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
-    VkRenderingInfo ri{VK_STRUCTURE_TYPE_RENDERING_INFO};
-    uint32_t w = UINT32_MAX;
-    uint32_t h = UINT32_MAX;
-    if (att_color_) {
-        ca.imageView = att_color_->attach;
-        ca.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-        ca.loadOp = att_load_;
-        ca.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-        ri.colorAttachmentCount = 1;
-        ri.pColorAttachments = &ca;
-        w = att_color_->w;
-        h = att_color_->h;
-    }
+
+    pass_ = OpenPass{};
+    pass_.frame = cl_;
+    pass_.color = att_color_;
+    pass_.depth = att_depth_;
+    pass_.load = att_load_;
+    pass_.w = att_color_ ? att_color_->w : UINT32_MAX;
+    pass_.h = att_color_ ? att_color_->h : UINT32_MAX;
     if (att_depth_) {
-        da.imageView = att_depth_->attach;
-        da.imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
-        da.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
-        da.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-        ri.pDepthAttachment = &da;
-        if (HasStencil(att_depth_->format)) ri.pStencilAttachment = &da;
-        w = std::min(w, att_depth_->w);
-        h = std::min(h, att_depth_->h);
+        pass_.w = std::min(pass_.w, att_depth_->w);
+        pass_.h = std::min(pass_.h, att_depth_->h);
     }
-    ri.renderArea = {{0, 0}, {w, h}};
-    ri.layerCount = 1;
+    // a pass that does not load its colour covers every pixel, whatever its draws reach
+    if (att_load_ != VK_ATTACHMENT_LOAD_OP_LOAD) TouchAll();
+
+    const VkFormat color = att_color_ ? att_color_->format : VK_FORMAT_UNDEFINED;
+    const VkFormat depth = att_depth_ ? att_depth_->format : VK_FORMAT_UNDEFINED;
+    const uint32_t samples = (att_color_ ? att_color_ : att_depth_)->samples;
+    VkCommandBufferInheritanceRenderingInfo ir{VK_STRUCTURE_TYPE_COMMAND_BUFFER_INHERITANCE_RENDERING_INFO};
+    ir.colorAttachmentCount = att_color_ ? 1 : 0;
+    ir.pColorAttachmentFormats = &color;
+    ir.depthAttachmentFormat = depth;
+    ir.stencilAttachmentFormat = att_depth_ && HasStencil(depth) ? depth : VK_FORMAT_UNDEFINED;
+    ir.rasterizationSamples = VkSampleCountFlagBits(std::max(samples, 1u));
+    VkCommandBufferInheritanceInfo ii{VK_STRUCTURE_TYPE_COMMAND_BUFFER_INHERITANCE_INFO};
     if (dynamic_rendering_) {
-        vkCmdBeginRendering(cl_, &ri);
+        ii.pNext = &ir;
     } else {
-        VkRenderPassBeginInfo bi{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
-        bi.renderPass = CompatiblePass(att_color_ ? att_color_->format : VK_FORMAT_UNDEFINED,
-                                       att_depth_ ? att_depth_->format : VK_FORMAT_UNDEFINED,
-                                       (att_color_ ? att_color_ : att_depth_)->samples, att_load_);
-        bi.framebuffer = Framebuffer(att_color_, att_depth_, w, h);
-        bi.renderArea = ri.renderArea;
-        vkCmdBeginRenderPass(cl_, &bi, VK_SUBPASS_CONTENTS_INLINE);
+        ii.renderPass = CompatiblePass(color, depth, samples);
+        ii.framebuffer = Framebuffer(att_color_, att_depth_, pass_.w, pass_.h);
     }
+    VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT | VK_COMMAND_BUFFER_USAGE_RENDER_PASS_CONTINUE_BIT;
+    bi.pInheritanceInfo = &ii;
+    pass_.draws = NextPassBuffer();
+    vkBeginCommandBuffer(pass_.draws, &bi);
+    cl_ = pass_.draws;
     rendering_ = true;
+    if (Crumbs& c = CurrentFrame().crumbs; c.detail) {
+        PassNote n;
+        Image* a = att_color_ ? att_color_ : att_depth_;
+        n.rt = bound_rt_ && bound_rt_->res.get() == att_color_ ? bound_rt_->data : 0;
+        n.w = pass_.w;
+        n.h = pass_.h;
+        n.format = uint32_t(a->format);
+        n.samples = a->samples;
+        n.depth = att_depth_ != nullptr;
+        c.notes.push_back(std::move(n));
+    }
+    ReplayState();
 }
 
+// the frame's next secondary command buffer for a pass, made the first time the frame needs this many
+VkCommandBuffer VulkanBackend::NextPassBuffer() {
+    Frame& f = CurrentFrame();
+    if (f.pass_at == f.passes.size()) {
+        VkCommandBufferAllocateInfo ai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+        ai.commandPool = f.pool;
+        ai.level = VK_COMMAND_BUFFER_LEVEL_SECONDARY;
+        ai.commandBufferCount = 1;
+        VkCommandBuffer cb = VK_NULL_HANDLE;
+        VK_CHECK(vkAllocateCommandBuffers(dev_, &ai, &cb));
+        f.passes.push_back(cb);
+    }
+    return f.passes[f.pass_at++];
+}
+
+// A secondary command buffer starts with nothing bound or set: what the draw set before the pass began (on the frame's
+// command buffer, where it does not carry over) is set in it again, and BoundState stays true to it
+void VulkanBackend::ReplayState() {
+    const BoundState was = bound_;
+    ForgetState();
+    bound_.vsc_set = was.vsc_set;
+    bound_.vsc_cb = was.vsc_cb;
+    if (was.pso) BindPipeline(was.pso);
+    if (was.set) {
+        bound_.set = was.set;
+        bound_.offsets[0] = was.offsets[0];
+        bound_.offsets[1] = was.offsets[1];
+        vkCmdBindDescriptorSets(cl_, VK_PIPELINE_BIND_POINT_GRAPHICS, layout_, 0, 1, &was.set, 2, was.offsets);
+    }
+    if (was.viewport_set) {
+        bound_.viewport = was.viewport;
+        bound_.viewport_set = true;
+        vkCmdSetViewport(cl_, 0, 1, &was.viewport);
+    }
+    if (was.scissor_set) {
+        bound_.scissor = was.scissor;
+        bound_.scissor_set = true;
+        vkCmdSetScissor(cl_, 0, 1, &was.scissor);
+    }
+    if (was.blend_set) SetBlendConstants(was.blend);
+    if (was.ref_set) SetStencilReference(was.ref);
+    if (was.topology_set) SetTopology(was.topology);
+}
+
+void VulkanBackend::Touch(const VkRect2D& r) {
+    if (!r.extent.width || !r.extent.height) return;
+    const int32_t x1 = r.offset.x + int32_t(r.extent.width), y1 = r.offset.y + int32_t(r.extent.height);
+    if (pass_.x1 <= pass_.x0) {
+        pass_.x0 = r.offset.x, pass_.y0 = r.offset.y, pass_.x1 = x1, pass_.y1 = y1;
+    } else {
+        pass_.x0 = std::min(pass_.x0, r.offset.x), pass_.y0 = std::min(pass_.y0, r.offset.y);
+        pass_.x1 = std::max(pass_.x1, x1), pass_.y1 = std::max(pass_.y1, y1);
+    }
+}
+
+void VulkanBackend::TouchAll() { Touch({{0, 0}, {pass_.w, pass_.h}}); }
+
+// a draw reaches no pixel outside the scissor, which every draw sets
+void VulkanBackend::TouchScissor() {
+    pass_.drawn = true;
+    if (bound_.scissor_set) Touch(bound_.scissor);
+    else TouchAll();
+}
+
+// The recorded pass begins, over the tiles its draws reached, with the load ops its leading clears made
 void VulkanBackend::EndRendering() {
     if (!rendering_) return;
-    if (dynamic_rendering_) vkCmdEndRendering(cl_);
-    else vkCmdEndRenderPass(cl_);
     rendering_ = false;
+    vkEndCommandBuffer(pass_.draws);
+    cl_ = pass_.frame;
+    const bool clears = pass_.clear_color || pass_.clear_depth || pass_.clear_stencil;
+    if (clears) TouchAll();  // a load op clears the whole render area
+    if (pass_.x1 <= pass_.x0) return CrumbPass(false);  // nothing drawn: the attachments keep what they hold
+    // the area out to whole 32 pixel tiles (Mali's are 16 or 32), within the attachments
+    constexpr int32_t kTile = 32;
+    const int32_t x0 = std::max(pass_.x0, 0) & ~(kTile - 1), y0 = std::max(pass_.y0, 0) & ~(kTile - 1);
+    const int32_t x1 = std::min((pass_.x1 + kTile - 1) & ~(kTile - 1), int32_t(pass_.w));
+    const int32_t y1 = std::min((pass_.y1 + kTile - 1) & ~(kTile - 1), int32_t(pass_.h));
+    if (x1 <= x0 || y1 <= y0) return CrumbPass(false);
+    const VkRect2D area{{x0, y0}, {uint32_t(x1 - x0), uint32_t(y1 - y0)}};
+    const VkAttachmentLoadOp color_load = pass_.clear_color ? VK_ATTACHMENT_LOAD_OP_CLEAR : pass_.load;
+    const VkAttachmentLoadOp depth_load = pass_.clear_depth ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_LOAD;
+    const VkAttachmentLoadOp stencil_load =
+        pass_.clear_stencil ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_LOAD;
+    if (dynamic_rendering_) {
+        VkRenderingAttachmentInfo ca{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+        VkRenderingAttachmentInfo da{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+        VkRenderingAttachmentInfo sa{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+        VkRenderingInfo ri{VK_STRUCTURE_TYPE_RENDERING_INFO};
+        ri.flags = VK_RENDERING_CONTENTS_SECONDARY_COMMAND_BUFFERS_BIT;
+        if (pass_.color) {
+            ca.imageView = pass_.color->attach;
+            ca.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+            ca.loadOp = color_load;
+            ca.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+            ca.clearValue = pass_.color_value;
+            ri.colorAttachmentCount = 1;
+            ri.pColorAttachments = &ca;
+        }
+        if (pass_.depth) {
+            da.imageView = pass_.depth->attach;
+            da.imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+            da.loadOp = depth_load;
+            da.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+            da.clearValue = pass_.depth_value;
+            ri.pDepthAttachment = &da;
+            if (HasStencil(pass_.depth->format)) {
+                sa = da;
+                sa.loadOp = stencil_load;
+                ri.pStencilAttachment = &sa;
+            }
+        }
+        ri.renderArea = area;
+        ri.layerCount = 1;
+        vkCmdBeginRendering(cl_, &ri);
+        vkCmdExecuteCommands(cl_, 1, &pass_.draws);
+        vkCmdEndRendering(cl_);
+        return CrumbPass(true);
+    }
+    const VkFormat color = pass_.color ? pass_.color->format : VK_FORMAT_UNDEFINED;
+    const VkFormat depth = pass_.depth ? pass_.depth->format : VK_FORMAT_UNDEFINED;
+    VkClearValue values[2] = {};
+    uint32_t n = 0;
+    if (pass_.color) values[n++] = pass_.color_value;
+    if (pass_.depth) values[n++] = pass_.depth_value;
+    VkRenderPassBeginInfo bi{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
+    bi.renderPass = RenderPassFor(color, depth, (pass_.color ? pass_.color : pass_.depth)->samples, color_load,
+                                  depth_load, stencil_load);
+    bi.framebuffer = Framebuffer(pass_.color, pass_.depth, pass_.w, pass_.h);
+    bi.renderArea = area;
+    bi.clearValueCount = n;
+    bi.pClearValues = values;
+    vkCmdBeginRenderPass(cl_, &bi, VK_SUBPASS_CONTENTS_SECONDARY_COMMAND_BUFFERS);
+    vkCmdExecuteCommands(cl_, 1, &pass_.draws);
+    vkCmdEndRenderPass(cl_);
+    CrumbPass(true);
 }
 
 // without dynamic rendering: the attachments loaded and stored and left in their layouts, as EnsureRendering's
 // dynamic rendering does; a pipeline needs only a compatible pass, formats and samples
 VkRenderPass VulkanBackend::CompatiblePass(VkFormat color, VkFormat depth, uint32_t samples,
                                            VkAttachmentLoadOp load) {
-    uint64_t key = uint64_t(color) | uint64_t(depth) << 24 | uint64_t(samples) << 40 |
-                   uint64_t(load == VK_ATTACHMENT_LOAD_OP_DONT_CARE) << 60;
+    return RenderPassFor(color, depth, samples, load, VK_ATTACHMENT_LOAD_OP_LOAD, VK_ATTACHMENT_LOAD_OP_LOAD);
+}
+
+// passes differing only in their load ops are compatible: pipelines, framebuffers and a pass's draws take any of them
+VkRenderPass VulkanBackend::RenderPassFor(VkFormat color, VkFormat depth, uint32_t samples,
+                                          VkAttachmentLoadOp color_load, VkAttachmentLoadOp depth_load,
+                                          VkAttachmentLoadOp stencil_load) {
+    const uint32_t k[6] = {uint32_t(color), uint32_t(depth), samples, uint32_t(color_load), uint32_t(depth_load),
+                           uint32_t(stencil_load)};
+    const uint64_t key = Hash(k, sizeof(k));
+    std::lock_guard lock(pass_lock_);
     if (auto it = passes_.find(key); it != passes_.end()) return it->second;
     VkAttachmentDescription at[2] = {};
     VkAttachmentReference cr{0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
@@ -2192,7 +2750,7 @@ VkRenderPass VulkanBackend::CompatiblePass(VkFormat color, VkFormat depth, uint3
     auto count = VkSampleCountFlagBits(std::max(samples, 1u));
     uint32_t n = 0;
     if (color != VK_FORMAT_UNDEFINED) {
-        at[n] = {0, color, count, load, VK_ATTACHMENT_STORE_OP_STORE,
+        at[n] = {0, color, count, color_load, VK_ATTACHMENT_STORE_OP_STORE,
                  VK_ATTACHMENT_LOAD_OP_DONT_CARE, VK_ATTACHMENT_STORE_OP_DONT_CARE,
                  VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
         cr.attachment = n++;
@@ -2200,7 +2758,7 @@ VkRenderPass VulkanBackend::CompatiblePass(VkFormat color, VkFormat depth, uint3
         sp.pColorAttachments = &cr;
     }
     if (depth != VK_FORMAT_UNDEFINED) {
-        at[n] = {0, depth, count, VK_ATTACHMENT_LOAD_OP_LOAD, VK_ATTACHMENT_STORE_OP_STORE, VK_ATTACHMENT_LOAD_OP_LOAD,
+        at[n] = {0, depth, count, depth_load, VK_ATTACHMENT_STORE_OP_STORE, stencil_load,
                  VK_ATTACHMENT_STORE_OP_STORE, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
                  VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL};
         dr.attachment = n++;
@@ -2431,6 +2989,7 @@ void VulkanBackend::Begin() {
 
 void VulkanBackend::Submit(bool wait) {
     EndRendering();
+    CrumbEnd();
     vkEndCommandBuffer(cl_);
     uint64_t value = ++fence_value_;
     VkTimelineSemaphoreSubmitInfo ts{VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO};
@@ -2442,17 +3001,15 @@ void VulkanBackend::Submit(bool wait) {
     si.pCommandBuffers = cmds;
     si.signalSemaphoreCount = timeline_ ? 1 : 0;
     si.pSignalSemaphores = &fence_;
-    if (timeline_) {
-        VK_CHECK(vkQueueSubmit(queue_, 1, &si, VK_NULL_HANDLE));
-    } else {
-        std::lock_guard lock(fence_lock_);
-        VK_CHECK(vkQueueSubmit(queue_, 1, &si, SubmitFence(value)));
-    }
+    bool submitted = QueueSubmit(si, value);
     Frame& f = CurrentFrame();
     f.fence = fence_value_;
+    if (!submitted) f.crumbs.seq = 0;  // never on the GPU: the failed submit is logged
     if (wait) {
         WaitFence(fence_value_);
+        CrumbCheck(f, "flush");
         vkResetCommandPool(dev_, f.pool, 0);
+        f.pass_at = 0;
         ResetPools(f);
         f.garbage.clear();
         f.garbage_buffers.clear();
@@ -2461,6 +3018,7 @@ void VulkanBackend::Submit(bool wait) {
         bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
         vkBeginCommandBuffer(cl_, &bi);
         Begin();
+        CrumbBegin();
     }
 }
 
@@ -2502,6 +3060,7 @@ void VulkanBackend::UploadNewTexture(Tex& tx, const TextureDesc& d, const uint8_
 }
 
 void VulkanBackend::WaitFence(uint64_t value) {
+    if (device_lost_) return;
     if (!timeline_) {
         if (!value || CompletedFence() >= value) return;
         // the lock is held through the wait so no fence is reset under it; the GPU needs no thread to get there
@@ -2509,7 +3068,7 @@ void VulkanBackend::WaitFence(uint64_t value) {
         for (const Pending& p : pending_)
             if (p.value >= value) {
                 host::NoteRenderPhase("wait fence");
-                vkWaitForFences(dev_, 1, &p.fence, VK_TRUE, UINT64_MAX);
+                if (vkWaitForFences(dev_, 1, &p.fence, VK_TRUE, UINT64_MAX) == VK_ERROR_DEVICE_LOST) device_lost_ = true;
                 break;
             }
         PollFences();
@@ -2520,10 +3079,11 @@ void VulkanBackend::WaitFence(uint64_t value) {
     wi.pSemaphores = &fence_;
     wi.pValues = &value;
     host::NoteRenderPhase("wait fence");
-    VK_CHECK(vkWaitSemaphores(dev_, &wi, UINT64_MAX));
+    if (vkWaitSemaphores(dev_, &wi, UINT64_MAX) == VK_ERROR_DEVICE_LOST) device_lost_ = true;
 }
 
 uint64_t VulkanBackend::CompletedFence() {
+    if (device_lost_) return fence_value_;
     if (!timeline_) {
         std::lock_guard lock(fence_lock_);
         PollFences();
@@ -2544,6 +3104,34 @@ void VulkanBackend::PollFences() {
         done++;
     }
     pending_.erase(pending_.begin(), pending_.begin() + done);
+}
+
+// a submit that signals value: the timeline semaphore in si, or a fence of its own. Its fence is taken back when the
+// submit fails, as nothing will ever signal it: left in pending_, the next WaitFence waited on it for good, and a lost
+// GPU on the fence path (Infinix X6882, Mali-G57 with a Vulkan 1.1 driver) froze the game in 'wait fence'. A lost
+// device is reported once and every wait from then on returns: the picture stops, the game does not hang
+bool VulkanBackend::QueueSubmit(const VkSubmitInfo& si, uint64_t value) {
+    VkResult r;
+    if (timeline_) {
+        r = vkQueueSubmit(queue_, 1, &si, VK_NULL_HANDLE);
+    } else {
+        std::lock_guard lock(fence_lock_);
+        VkFence fence = SubmitFence(value);
+        r = vkQueueSubmit(queue_, 1, &si, fence);
+        if (r != VK_SUCCESS) {
+            pending_.pop_back();
+            spare_fences_.push_back(fence);
+        }
+    }
+    if (r == VK_SUCCESS) return true;
+    if (r == VK_ERROR_DEVICE_LOST) {
+        if (!device_lost_.exchange(true))
+            LOGE("vulkan: the GPU was lost at submit %llu (frame %llu): the picture stops here",
+                 (unsigned long long)value, (unsigned long long)presents_);
+    } else {
+        LOGE("vulkan: vkQueueSubmit failed (%d) at submit %llu", int(r), (unsigned long long)value);
+    }
+    return false;
 }
 
 // the fence the submit of this value signals; fence_lock_ held
@@ -2668,14 +3256,34 @@ uint32_t VulkanBackend::Samples(uint32_t want) {
 
 bool VulkanBackend::BindTargets(const State& s) {
     Target* rt = EnsureTarget(s.rt, false);
-    Target* ds = s.rs[kRsZEnable] || s.rs[kRsStencilEnable] ? EnsureTarget(s.zs, true) : nullptr;
-    if (rt && ds && (rt->w != ds->w || rt->h != ds->h || Ms(*rt) != Ms(*ds))) ds = nullptr;
+    const bool uses_depth = s.rs[kRsZEnable] || s.rs[kRsStencilEnable];
+    Target* ds = uses_depth ? EnsureTarget(s.zs, true) : nullptr;
+    auto fits = [&](const Target* d) { return rt->w == d->w && rt->h == d->h && Ms(*rt) == Ms(*d); };
+    if (rt && ds && !fits(ds)) ds = nullptr;
+    // A draw that neither tests nor writes depth keeps the depth buffer its target already renders with: its pipeline
+    // leaves it alone (KeyDepthStencil takes depth and stencil off), and the pass goes on. Dropped, it changed the
+    // attachments, and a tiler stored the whole frame and loaded it back each time the title turned depth off and on:
+    // the glow test's quads, flashes, the HUD, several times a frame and more with every light in a firefight
+    // Not when the draw samples that depth buffer (the post effects read the scene's depth): an attachment cannot be read
+    // as a texture in the same pass
+    auto sampled = [&](uint32_t data) {
+        for (size_t i = 0; i < 4; i++) {
+            TextureDesc d;
+            if (s.textures[i] && Describe(s.textures[i], d) && d.data == data) return true;
+        }
+        return false;
+    };
+    if (!uses_depth && rt && rt->depth_data) {
+        auto it = targets_.find(TargetMapKey(rt->depth_data, true));
+        if (it != targets_.end() && it->second.res && fits(&it->second) && !sampled(it->second.data)) ds = &it->second;
+    }
+    if (rt && ds && uses_depth) rt->depth_data = ds->data;
     if (!rt && !ds) return false;
     if (rt) {
-        if (LatchCpuWrite(*rt)) UploadTarget(*rt, s.rt);
+        if (CpuWrote(*rt)) UploadTarget(*rt, s.rt);
         rt->drawn = true;
     }
-    if (ds) ds->drawn = true;
+    if (ds && uses_depth) ds->drawn = true;
     if (rt != bound_rt_ || ds != bound_ds_) {
         SetAttachments(rt ? rt->res.get() : nullptr, ds ? ds->res.get() : nullptr);
         bound_rt_ = rt;
@@ -2926,7 +3534,10 @@ void VulkanBackend::DrawFullScreen(VkPipeline pso, Bindings& b, bool samplers_se
     PushBindings(b);
     SetTopology(VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST);
     EnsureRendering();
+    TouchScissor();
     vkCmdDraw(cl_, 3, 1, 0, 0);
+    crumb_draw_ = {};
+    CrumbNote(nullptr);
 }
 
 void VulkanBackend::Blit(Image* src, const float uvrect[4], const BlitOptions& o) {
@@ -2950,6 +3561,22 @@ VkShaderModule VulkanBackend::Compile(const std::string& src, const char* entry,
     hash = Hash(src.data(), src.size(), entry_seed);
     auto it = blobs_.find(hash);
     if (it != blobs_.end()) return it->second;
+    bool vertex_stage = profile[0] == 'v';
+    if (async_draw_) {
+        // made by the async thread by now (the disk cache has it), or queued for it and the draw left out meanwhile
+        std::vector<uint32_t> spirv;
+        if (!vkshader::Cached(hash, spirv)) {
+            QueueAsync({.src = src, .entry = entry, .vertex = vertex_stage, .hash = hash});
+            return VK_NULL_HANDLE;
+        }
+        VkShaderModuleCreateInfo mi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+        mi.codeSize = spirv.size() * sizeof(uint32_t);
+        mi.pCode = spirv.data();
+        VkShaderModule module = VK_NULL_HANDLE;
+        VK_CHECK(vkCreateShaderModule(dev_, &mi, nullptr, &module));
+        blobs_[hash] = module;
+        return module;
+    }
     PerfScope perf_compile{g_perf.compile};
     g_perf.shaders++;
     bool vertex = profile[0] == 'v';
@@ -3172,6 +3799,7 @@ Image* VulkanBackend::Feedback(Target& t) {
     }
     Transition(*t.res, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
     Transition(*t.fb, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    EndRendering();  // both already in their layouts end no pass, and a copy is never inside one
     VkImageSubresourceLayers layer{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
     if (samples > 1) {
         VkImageResolve r{layer, {0, 0, 0}, layer, {0, 0, 0}, {t.w, t.h, 1}};
@@ -3243,6 +3871,30 @@ VkPipeline VulkanBackend::EnsurePipeline(const PsoKey& k, VkShaderModule vs, VkS
         last_pso_ = it->second;
         return it->second;
     }
+    VkPipeline pso = VK_NULL_HANDLE;
+    {
+        std::lock_guard lock(warm_lock_);
+        if (auto w = warm_.find(h); w != warm_.end()) {
+            pso = w->second;
+            warm_.erase(w);
+        } else {
+            built_.insert(h);  // the warm thread leaves it out from now on
+        }
+    }
+    if (!pso && async_draw_) {
+        QueueAsync({.pipeline = true, .hash = h, .key = k, .vs = vs, .ps = ps});
+        return VK_NULL_HANDLE;
+    }
+    if (!pso) {
+        g_perf.psos++;
+        pso = CreateDrawPipeline(k, vs, ps);
+    }
+    if (pso_known_.insert(h).second) pso_keys_.push_back(k);
+    psos_[h] = pso;
+    return pso;
+}
+
+VkPipeline VulkanBackend::CreateDrawPipeline(const PsoKey& k, VkShaderModule vs, VkShaderModule ps) {
     VkFormat color = k.has_rt ? VkFormat(k.rtfmt) : VK_FORMAT_UNDEFINED;
     VkFormat depth = k.has_ds ? depth_fmt_ : VK_FORMAT_UNDEFINED;
     PipelineParts p(vs, ps, layout_, color, depth, std::max(k.msaa, 1u), true);
@@ -3269,12 +3921,11 @@ VkPipeline VulkanBackend::EnsurePipeline(const PsoKey& k, VkShaderModule vs, VkS
     p.raster.depthClampEnable = k.unclipped && depth_clamp_;
     FillDepthStencil(k, p.depth);
     VkPipeline pso = VK_NULL_HANDLE;
-    g_perf.psos++;
     CompletePipeline(p);
     if (vkCreateGraphicsPipelines(dev_, pipeline_cache_, 1, &p.info, nullptr, &pso) != VK_SUCCESS) {
         LOGE("vulkan: pipeline creation failed");
+        pso = VK_NULL_HANDLE;
     }
-    psos_[h] = pso;
     return pso;
 }
 
@@ -3294,7 +3945,7 @@ Image* VulkanBackend::BindTargetTexture(const State& s, int stage, const Texture
     stages.rt[stage] = true;
     stages.gw[stage] = t.depth ? 0 : t.gw;
     info.flags |= kTexTarget;
-    if (!t.depth && LatchCpuWrite(t)) {
+    if (!t.depth && CpuWrote(t)) {
         Surface su;
         su.header = s.textures[size_t(stage)];
         UploadTarget(t, su);
@@ -3617,8 +4268,11 @@ void VulkanBackend::EnsureVertexShader(const State& s, const Assembled& a, DrawS
     auto vit = shader_src_.find(sh.vkey);
     if (vit != shader_src_.end()) {
         sh.vh = vit->second;
-        sh.vs_code = blobs_[sh.vh];
-        return;
+        if (auto b = blobs_.find(sh.vh); b != blobs_.end()) {
+            sh.vs_code = b->second;
+            return;
+        }
+        // still being made on the async thread: Compile takes it from there or waits on
     }
     sh.vs_code = Compile(VertexHlsl(s, a, sh), "main", "vs_5_0", sh.vh);
     shader_src_[sh.vkey] = sh.vh;
@@ -3687,8 +4341,10 @@ void VulkanBackend::EnsurePixelShader(const PixelKey& pk, DrawShaders& sh) {
     auto pit = shader_src_.find(sh.pkey ^ kPixelKeySalt);
     if (pit != shader_src_.end()) {
         sh.ph = pit->second;
-        sh.ps_code = blobs_[sh.ph];
-        return;
+        if (auto b = blobs_.find(sh.ph); b != blobs_.end()) {
+            sh.ps_code = b->second;
+            return;
+        }
     }
     std::string src = PixelHlsl(pk);
     if (sh.near_depth) src = NearDepthHlsl(std::move(src));
@@ -4028,6 +4684,9 @@ void VulkanBackend::CaptureTextures(const State& s, const DrawTextures& stages) 
         fprintf(cap_, " | t%d %08X fmt %X %ux%u%s%s", i, d.data, d.format, d.width, d.height, tg ? " target" : "",
                 res ? "" : " unbound");
         if (uint32_t op = s.tss[size_t(i)][kTssColorKeyOp]) fprintf(cap_, " colorkey %u %08X", op, s.tss[size_t(i)][kTssColorKeyColor]);
+        const auto& ts = s.tss[size_t(i)];
+        fprintf(cap_, " addr %u,%u filt %u/%u/%u aniso %u", ts[kTssAddressU], ts[kTssAddressV], ts[kTssMagFilter],
+                ts[kTssMinFilter], ts[kTssMipFilter], ts[kTssMaxAnisotropy]);
         // any colour format: CapSave samples it; P8 entries are keyed by palette too, so match the image itself
         if (res && !tg && stages.info[i].kind == kTex2D && !Format(d.format).depth && cap_seen_.insert(d.data).second) {
             for (auto& [key, tx] : textures_)
@@ -4072,12 +4731,74 @@ void VulkanBackend::CaptureDraw(const State& s, uint32_t prim, uint32_t count, c
             cap_i_++, s.rt.data, bound_ds_ ? s.zs.data : 0, prim, count, s.vs_handle, s.ps ? s.ps->handle : 0, k.blend,
             k.src, k.dst, k.zen, k.zfunc, k.zwrite, k.zbias, k.zslope, k.cull, k.wmask, c.pc[0][0], c.pc[0][1],
             c.pc[0][2], c.pc[0][3]);
+    // the alpha test as the shader runs it: function (Cmp - 1, 8 always) against the reference
+    fprintf(cap_, " atest %.0f ref %.0f", c.misc[1], c.misc[0]);
     CaptureTextures(s, stages);
 }
 
-// small draws: their inputs and constants; then ends the draw's line
+// small draws: their inputs and constants; then ends the draw's line. Every draw: its raw positions (register 0,
+// float3 or float4) and the fixed-function transforms, enough to place its edges on screen offline
 void VulkanBackend::EndDrawCapture(const State& s, const Assembled& a, uint32_t count, const DrawConstants& c) {
     if (count <= kQuadVertices) CaptureInputs(s, a, c);
+    const VertexElement& e = a.elements[0];
+    if ((a.regs & 1) && (e.format == DXGI_FORMAT_R32G32B32_FLOAT || e.format == DXGI_FORMAT_R32G32B32A32_FLOAT) &&
+        a.vertices.empty()) {
+        const VertexBuffer& vb = a.buffers[e.buffer];
+        uint32_t n = std::min<uint32_t>(a.vertex_count, 512);
+        if (vb.src && vb.stride && uint64_t(n) * vb.stride <= vb.bytes) {
+            fprintf(cap_, "\n     pos %u", a.vertex_count);
+            for (uint32_t v = 0; v < n; v++) {
+                float p[3];
+                std::memcpy(p, vb.src + size_t(v) * vb.stride + e.offset, sizeof(p));
+                fprintf(cap_, " %.5g,%.5g,%.5g", p[0], p[1], p[2]);
+            }
+        }
+    }
+    // register 2's packed normal (NORMPACKED3, 11:11:10 signed, as UnpackNp3 reads it) and register 9's float2 uv
+    auto reg_dump = [&](int r, const char* tag, bool packed) {
+        const VertexElement& el = a.elements[size_t(r)];
+        if (!(a.regs >> r & 1) || !a.vertices.empty()) return;
+        const VertexBuffer& b = a.buffers[el.buffer];
+        uint32_t n = std::min<uint32_t>(a.vertex_count, 512);
+        if (!b.src || !b.stride || uint64_t(n) * b.stride > b.bytes) return;
+        fprintf(cap_, "\n     %s", tag);
+        for (uint32_t v = 0; v < n; v++) {
+            const uint8_t* at = b.src + size_t(v) * b.stride + el.offset;
+            if (packed) {
+                uint32_t u;
+                std::memcpy(&u, at, 4);
+                int x = int32_t(u << 21) >> 21, y = int32_t(u << 10) >> 21, z = int32_t(u) >> 22;
+                fprintf(cap_, " %.3f,%.3f,%.3f", std::max(x / 1023.0f, -1.0f), std::max(y / 1023.0f, -1.0f),
+                        std::max(z / 511.0f, -1.0f));
+            } else {
+                float f[2];
+                std::memcpy(f, at, sizeof(f));
+                fprintf(cap_, " %.4g,%.4g", f[0], f[1]);
+            }
+        }
+    };
+    if (a.elements[2].format == DXGI_FORMAT_R32_UINT) reg_dump(2, "nrm", true);
+    if (a.elements[9].format == DXGI_FORMAT_R32G32_FLOAT) reg_dump(9, "uv", false);
+    // the lights (D3DLIGHT8 as floats after the type), the material and the ambient
+    for (int i = 0; i < 8; i++) {
+        const auto& l = s.lights[size_t(i)];
+        if (!l[0]) continue;
+        fprintf(cap_, "\n     light%d type %u", i, l[0]);
+        for (int k = 1; k < 26; k++) {
+            float f;
+            std::memcpy(&f, &l[size_t(k)], 4);
+            fprintf(cap_, " %.4g", f);
+        }
+    }
+    fprintf(cap_, "\n     material");
+    for (float f : s.material) fprintf(cap_, " %.4g", f);
+    fprintf(cap_, "\n     ambient %08X lighting %u", s.rs[kRsAmbient], s.rs[kRsLighting]);
+    for (int m : {256, 2, 3}) {
+        fprintf(cap_, "\n     m%d", m);
+        for (float f : s.transforms[size_t(m)]) fprintf(cap_, " %.7g", f);
+    }
+    fprintf(cap_, "\n     vp %u %u %u %u %.3f %.3f", s.viewport.x, s.viewport.y, s.viewport.w, s.viewport.h,
+            s.viewport.min_z, s.viewport.max_z);
     fputc('\n', cap_);
 }
 
@@ -4146,7 +4867,41 @@ VkPrimitiveTopology PrimitiveTopology(const Assembled& a) {
     return a.strip ? VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP : VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
 }
 
-void VulkanBackend::DrawGeometry(const Assembled& a) {
+// A pretransformed fixed function draw's triangles in host pixels. Its positions are the console's screen coordinates,
+// taken half a pixel on and mapped over the whole target (FixedVertexHlsl, kVsEpilogue, SetViewportScissor's full
+// viewport), so every vertex the buffers hold bounds it. Its own pass then covers only those tiles: the glow test's
+// quads and the restore of their patch, a few tiles of the frame each. False where that cannot be told for certain:
+// points and lines have a size, a w at or behind the eye is clipped to anywhere, and a long buffer is not worth it.
+bool ScreenBounds(const Assembled& a, GuestExtent size, uint32_t W, uint32_t H, VkRect2D& out) {
+    constexpr uint8_t kFloat4 = 2, kFloat3 = 6;  // DXGI_FORMAT_R32G32B32A32_FLOAT, R32G32B32_FLOAT
+    constexpr uint32_t kMostVertices = 1024;
+    if (!a.pretransformed || a.topology != Topology::Triangles || !(a.regs & 1) || !size.w || !size.h) return false;
+    const VertexElement& e = a.elements[0];
+    if ((e.format != kFloat4 && e.format != kFloat3) || e.buffer >= a.buffer_count) return false;
+    const VertexBuffer& b = a.buffers[e.buffer];
+    const uint32_t need = e.offset + (e.format == kFloat4 ? 16u : 12u);
+    if (!b.src || !b.stride || b.bytes < need || (b.bytes - need) / b.stride + 1 > kMostVertices) return false;
+    float x0 = INFINITY, y0 = INFINITY, x1 = -INFINITY, y1 = -INFINITY;
+    for (uint32_t at = e.offset; at + need - e.offset <= b.bytes; at += b.stride) {
+        float v[4] = {0, 0, 0, 1};
+        std::memcpy(v, b.src + at, e.format == kFloat4 ? 16 : 12);
+        if (!std::isfinite(v[0]) || !std::isfinite(v[1]) || !(v[3] > 0) || !std::isfinite(v[3])) return false;
+        x0 = std::min(x0, v[0]), y0 = std::min(y0, v[1]), x1 = std::max(x1, v[0]), y1 = std::max(y1, v[1]);
+    }
+    if (!(x1 >= x0)) return false;
+    // host pixels, a console pixel and two host ones wider each way for the half pixel, the edge snap and rounding
+    const float sx = float(W) / float(size.w), sy = float(H) / float(size.h);
+    const float l = (x0 + 0.5f - 1) * sx - 2, t = (y0 + 0.5f - 1) * sy - 2;
+    const float r = (x1 + 0.5f + 1) * sx + 2, bt = (y1 + 0.5f + 1) * sy + 2;
+    const int32_t il = std::clamp<int32_t>(int32_t(std::floor(l)), 0, int32_t(W));
+    const int32_t it = std::clamp<int32_t>(int32_t(std::floor(t)), 0, int32_t(H));
+    const int32_t ir = std::clamp<int32_t>(int32_t(std::ceil(r)), 0, int32_t(W));
+    const int32_t ib = std::clamp<int32_t>(int32_t(std::ceil(bt)), 0, int32_t(H));
+    out = {{il, it}, {uint32_t(std::max(ir - il, 0)), uint32_t(std::max(ib - it, 0))}};
+    return true;
+}
+
+void VulkanBackend::DrawGeometry(const Assembled& a, const VkRect2D* bounds) {
     VkBuffer buffers[16];
     VkDeviceSize offsets[16];
     VkDeviceSize sizes[16];
@@ -4165,23 +4920,38 @@ void VulkanBackend::DrawGeometry(const Assembled& a) {
         sizes[i] = uint64_t(b.bytes) + kTail;
         strides[i] = b.stride;
     }
+    Alloc ib{};
+    if (a.index_count) {
+        uint32_t ibytes = a.index_count * (a.index16 ? 2 : 4);
+        ib = Upload(ibytes, 4);
+        std::memcpy(ib.cpu, a.index_src, ibytes);
+    }
+    // the buffers are bound in the pass's own command buffer, which nothing bound before the pass reaches
+    EnsureRendering();
     if (dynamic_state_) {
         if (a.buffer_count) vkCmdBindVertexBuffers2(cl_, 0, a.buffer_count, buffers, offsets, sizes, strides);
         SetTopology(PrimitiveTopology(a));
     } else if (a.buffer_count) {
         vkCmdBindVertexBuffers(cl_, 0, a.buffer_count, buffers, offsets);  // strides and topology in the pipeline
     }
+    if (bounds && bound_.scissor_set) {
+        // the scissor still clips it: the two overlapped
+        const VkRect2D& sc = bound_.scissor;
+        const int32_t l = std::max(bounds->offset.x, sc.offset.x), t = std::max(bounds->offset.y, sc.offset.y);
+        const int32_t r = std::min(bounds->offset.x + int32_t(bounds->extent.width), sc.offset.x + int32_t(sc.extent.width));
+        const int32_t b = std::min(bounds->offset.y + int32_t(bounds->extent.height), sc.offset.y + int32_t(sc.extent.height));
+        pass_.drawn = true;
+        if (r > l && b > t) Touch({{l, t}, {uint32_t(r - l), uint32_t(b - t)}});
+    } else {
+        TouchScissor();
+    }
     if (a.index_count) {
-        uint32_t ibytes = a.index_count * (a.index16 ? 2 : 4);
-        Alloc ib = Upload(ibytes, 4);
-        std::memcpy(ib.cpu, a.index_src, ibytes);
         vkCmdBindIndexBuffer(cl_, ib.buffer, ib.off, a.index16 ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32);
-        EnsureRendering();
         vkCmdDrawIndexed(cl_, a.index_count, 1, 0, a.base_vertex, 0);
     } else {
-        EnsureRendering();
         vkCmdDraw(cl_, a.draw_count, 1, 0, 0);
     }
+    CrumbNote(&a);
 }
 
 // Assemble, timed and counted
@@ -4198,17 +4968,31 @@ bool VulkanBackend::AssembleDraw(const State& s, uint32_t prim, uint32_t start, 
 void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t count, const uint8_t* indices) {
     PerfScope perf_draw{g_perf.draw};
     g_perf.draws++;
+    frame_draws_++;
+    if (Shown(s.rt.data)) {
+        if (!frame_shown_draws_++) {
+            frame_view_ = Hash(&s.transforms[2], 2 * sizeof(s.transforms[0]));
+            frame_consts_ = Hash(&s.vsc[96], 8 * sizeof(s.vsc[0]));  // D3D c0-c7: hardware order is register + 96
+        }
+    }
     if (cap_) CapStep(s.rt);
     // a capture lists the draws that never reach the target too, with the step that stopped them
     auto skip = [&](const char* why) {
+        frame_skips_++;
         if (cap_) fprintf(cap_, "---- skip rt %08X prim %u count %u vs %08X: %s\n", s.rt.data, prim, count, s.vs_handle, why);
     };
     if (DepthCopy(s)) return skip("depth copy");
+    if (SkipShadow(s)) return skip("shadow light left out");
     Assembled& a = asm_;
     if (!AssembleDraw(s, prim, start, count, indices, a)) return skip("vertices not assembled");
     if (!BindTargets(s)) return skip("targets not bound");
+    // a depth tested, depth writing draw into a colour surface: the scene's own geometry (FillCracks)
+    if (s.rt.header && s.zs.header && s.rs[kRsZEnable] && SimpleState(s, kMZWriteEnable)) {
+        scene_depth_[s.rt.data] = {s.zs, presents_};
+    }
 
-    // vertex shader
+    // vertex shader. A draw to the frame's own target may go without, a frame or a few, what is still being made
+    async_draw_ = game::Opt().async_shaders && Shown(s.rt.data);
     DrawShaders sh = ClassifyShaders(s, a);
     if (sh.prog) EnsureProgramHash(s);
     sh.vkey = VertexKey(s, a, sh);
@@ -4222,13 +5006,31 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
     sh.near_depth = NearDepth(s);
     sh.pkey = Hash(&pk, sizeof(pk)) ^ (sh.near_depth ? kNearDepthSalt : 0);
     EnsurePixelShader(pk, sh);
-    if (!sh.vs_code || !sh.ps_code) return skip(sh.vs_code ? "pixel shader failed" : "vertex shader failed");
+    if (!sh.vs_code || !sh.ps_code) {
+        bool waiting = async_draw_;
+        async_draw_ = false;
+        if (waiting) {
+            g_perf.deferred++;
+            return skip("shader being made");
+        }
+        return skip(sh.vs_code ? "pixel shader failed" : "vertex shader failed");
+    }
 
     // pipeline
     PsoKey k;
     BuildPipelineKey(s, a, sh.vh, sh.ph, k);
+    uint64_t psos_before = g_perf.psos;
     VkPipeline pso = EnsurePipeline(k, sh.vs_code, sh.ps_code);
-    if (!pso) return skip("pipeline failed");
+    // XBE_PERF: a pipeline that held the frame, and where its draw went, to tell what async shaders still miss
+    static int made_logged = 0;
+    if (g_perf.psos != psos_before && diag::Perf() && made_logged++ < 64)
+        LOGR("perf: pipeline made on the render thread, rt %08X %ux%u (shown %08X %08X %08X)", s.rt.data,
+                  bound_rt_ ? bound_rt_->gw : 0, bound_rt_ ? bound_rt_->gh : 0, shown_data_[0], shown_data_[1],
+                  shown_data_[2]);
+    bool waiting = async_draw_;
+    async_draw_ = false;
+    if (!pso && waiting) g_perf.deferred++;
+    if (!pso) return skip(waiting ? "pipeline being made" : "pipeline failed");
     BindPipeline(pso);
 
     // constants
@@ -4250,8 +5052,12 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
     SetViewportScissor(s, size.w);
     SetBlendFactorStencilRef(s, k);
 
-    // geometry
-    DrawGeometry(a);
+    // geometry, over the pixels it can reach
+    VkRect2D bounds;
+    const Image* target = bound_rt_ ? bound_rt_->res.get() : bound_ds_->res.get();
+    const bool bounded = !sh.prog && ScreenBounds(a, size, target->w, target->h, bounds);
+    crumb_draw_ = {.rt = s.rt.data, .vs = s.vs_handle, .prim = prim, .count = count, .tex0 = s.textures[0]};
+    DrawGeometry(a, bounded ? &bounds : nullptr);
     // the target after this draw, step_N matching draw N in frame.txt: finds the draw that wrote a bad pixel
     if (cap_) {
         auto it = targets_.find(TargetMapKey(mem::VirtualFromPhysical(s.rt.data), false));
@@ -4272,8 +5078,9 @@ VkClearRect ScaledRect(const Target& t, int x0, int y0, int x1, int y1) {
     return {{{l, tp}, {uint32_t(std::max(r - l, 0)), uint32_t(std::max(b - tp, 0))}}, 0, 1};
 }
 
-// rs: the rects buffer, reused across targets
-void VulkanBackend::ClearTarget(Target& t, const State& s, const ClearArgs& c, std::vector<VkClearRect>& rs) {
+// rs: the rects buffer, reused across targets; color and depth: the pass's attachments, t's among them
+void VulkanBackend::ClearTarget(Target& t, const State& s, const ClearArgs& c, std::vector<VkClearRect>& rs,
+                                Image* color, Image* depth) {
     rs.clear();
     auto add = [&](VkClearRect r) {
         if (r.rect.extent.width && r.rect.extent.height) rs.push_back(r);
@@ -4293,22 +5100,42 @@ void VulkanBackend::ClearTarget(Target& t, const State& s, const ClearArgs& c, s
         ca.aspectMask = ((c.flags & kClearZ) ? VK_IMAGE_ASPECT_DEPTH_BIT : 0) |
                         ((c.flags & kClearStencil) && HasStencil(t.res->format) ? VK_IMAGE_ASPECT_STENCIL_BIT : 0);
         ca.clearValue.depthStencil = {std::clamp(c.z, 0.0f, 1.0f), c.stencil & 0xFF};
-        SetAttachments(nullptr, t.res.get());
     } else {
         // pixels the CPU wrote before this clear go in first, a later upload would paint over the clear
-        if (LatchCpuWrite(t)) UploadTarget(t, s.rt);
+        if (CpuWrote(t)) UploadTarget(t, s.rt);
         ca.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
         float col[4];
         Color(c.color, col);
         for (int i = 0; t.range != 1 && i < 3; i++) col[i] /= t.range;
         std::memcpy(ca.clearValue.color.float32, col, sizeof(col));
-        SetAttachments(t.res.get(), nullptr);
     }
+    SetAttachments(color, depth);
     // the draws' targets are bound again
     bound_rt_ = bound_ds_ = nullptr;
     if (!rs.empty() && ca.aspectMask) {
         EnsureRendering();
-        vkCmdClearAttachments(cl_, 1, &ca, uint32_t(rs.size()), rs.data());
+        const VkRect2D& r = rs[0].rect;
+        const bool whole = rs.size() == 1 && r.offset.x == 0 && r.offset.y == 0 && r.extent.width >= pass_.w &&
+                           r.extent.height >= pass_.h;
+        if (whole && !pass_.drawn && pass_.load == VK_ATTACHMENT_LOAD_OP_LOAD) {
+            // the first thing in the pass and all of the attachment: its load op, nothing read to be overwritten
+            if (ca.aspectMask & VK_IMAGE_ASPECT_COLOR_BIT) {
+                pass_.clear_color = true;
+                pass_.color_value = ca.clearValue;
+            }
+            if (ca.aspectMask & VK_IMAGE_ASPECT_DEPTH_BIT) {
+                pass_.clear_depth = true;
+                pass_.depth_value.depthStencil.depth = ca.clearValue.depthStencil.depth;
+            }
+            if (ca.aspectMask & VK_IMAGE_ASPECT_STENCIL_BIT) {
+                pass_.clear_stencil = true;
+                pass_.depth_value.depthStencil.stencil = ca.clearValue.depthStencil.stencil;
+            }
+        } else {
+            for (const VkClearRect& cr : rs) Touch(cr.rect);
+            pass_.drawn = true;
+            vkCmdClearAttachments(cl_, 1, &ca, uint32_t(rs.size()), rs.data());
+        }
     }
     t.drawn = true;
 }
@@ -4322,7 +5149,9 @@ void VulkanBackend::Clear(const State& s, uint32_t count, const uint8_t* rects, 
         Occlusion(s, p);
         return;
     }
+    if (s.zs.header && (!s.rt.header || !s.rt.data) && SkipShadow(s)) return;  // a left out light's map
     PerfScope perf_clear{g_perf.clear};
+    if (flags & kClearZ) FillCracks(s);  // the scene's depth, before it goes
     if (cap_) {
         CapStep(s.rt);
         fprintf(cap_, "%04u clear rt %08X ds %08X flags %X color %08X z %.3f\n", cap_i_++, s.rt.data, s.zs.data, flags,
@@ -4332,8 +5161,32 @@ void VulkanBackend::Clear(const State& s, uint32_t count, const uint8_t* rects, 
     Target* ds = (flags & (kClearZ | kClearStencil)) ? EnsureTarget(s.zs, true) : nullptr;
     std::vector<VkClearRect> rs;
     ClearArgs c{.count = count, .rects = rects, .flags = flags, .color = color, .z = z, .stencil = stencil};
+    // Cleared in the pass the draws after them render in: the colour target with the depth buffer it draws with,
+    // whichever of the two is cleared. Each in a pass of its own, the frame's first clear loaded the target and the
+    // depth buffer from memory, and the draws began a third pass that loaded both again
+    auto fits = [](const Target* a, const Target* b) { return a->w == b->w && a->h == b->h && Ms(*a) == Ms(*b); };
+    Target* prt = rt;
+    Target* pds = ds;
+    if (rt && !ds && rt->depth_data) {
+        auto it = targets_.find(TargetMapKey(rt->depth_data, true));
+        if (it != targets_.end() && it->second.res) pds = &it->second;
+    } else if (ds && !rt) {
+        Target* r = FindTarget(s.rt, false);
+        if (r && r->depth_data == ds->data) prt = r;
+    }
+    if (prt && pds && !fits(prt, pds)) {
+        prt = rt;
+        pds = ds;
+    }
+    if (rt && ds && !fits(rt, ds)) {
+        ClearTarget(*rt, s, c, rs, rt->res.get(), nullptr);
+        ClearTarget(*ds, s, c, rs, nullptr, ds->res.get());
+        return;
+    }
+    Image* color_att = prt ? prt->res.get() : nullptr;
+    Image* depth_att = pds ? pds->res.get() : nullptr;
     for (Target* t : {rt, ds}) {
-        if (t) ClearTarget(*t, s, c, rs);
+        if (t) ClearTarget(*t, s, c, rs, color_att, depth_att);
     }
 }
 
@@ -4449,6 +5302,7 @@ void VulkanBackend::CopyByDraw(const Target& src_t, Image* src_res, Target& dst_
 void VulkanBackend::CopyByRegion(const Target& src_t, Image* src_res, Target& dst_t, const CopyList& l) {
     Transition(*src_res, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
     Transition(*dst_t.res, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    EndRendering();  // both already in their layouts end no pass, and a copy is never inside one
     float dst_scale = float(dst_t.w) / dst_t.gw;
     bool listed = l.count && l.src_rects;
     uint32_t n = listed ? l.count : 1;
@@ -4832,6 +5686,41 @@ Image* VulkanBackend::PrepareShownFrame(Target* t) {
     return r;
 }
 
+// Cracks, filled in the scene's own target just before its depth is cleared (this game clears depth after the scene,
+// before its HUD, so at the present the depth that tells a slit is gone): the target copied aside, then kCrackHlsl
+// reads the copy and the depth and writes every pixel back, a slit's from the surfaces either side. Once a frame, for
+// a target the frame's depth writing draws went to with this depth surface, single sampled
+void VulkanBackend::FillCracks(const State& s) {
+    if (!s.rt.header || !s.zs.header || crack_frame_ == presents_) return;
+    auto it = scene_depth_.find(s.rt.data);
+    if (it == scene_depth_.end() || it->second.frame != presents_ || it->second.zs.data != s.zs.data) return;
+    Target* t = FindTarget(s.rt, false);
+    Target* ds = FindTarget(s.zs, true);
+    if (!t || !ds || ds->w != t->w || ds->h != t->h || Ms(*ds) > 1 || Ms(*t) > 1 || !ds->res->view) return;
+    crack_frame_ = presents_;
+    VkFormat fmt = t->res->format;
+    if (!crack_ || crack_->w != t->w || crack_->h != t->h || crack_->format != fmt) {
+        Release(std::move(crack_));
+        crack_ = CreateImage(fmt, t->w, t->h, VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT);
+        if (!crack_) return;
+    }
+    EndRendering();  // a copy is never inside a pass
+    Transition(*t->res, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    Transition(*crack_, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    VkImageSubresourceLayers layer{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    VkImageCopy c{layer, {0, 0, 0}, layer, {0, 0, 0}, {t->w, t->h, 1}};
+    vkCmdCopyImage(cl_, t->res->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, crack_->image,
+                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &c);
+    Transition(*crack_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    Transition(*ds->res, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    Image* const src[3] = {crack_.get(), ds->res.get(), nullptr};
+    // one console pixel across, in host pixels (one at the console's own size)
+    float p[8] = {std::max(1.0f, std::ceil(scale_)), 0, 0, 0, 0, 0, 0, 0};
+    if (Pass(kCrackHlsl, "vs", "fill", fmt, t->res.get(), t->w, t->h, src, p, -1)) t->drawn = true;
+    // a depth target left readable would pass for one whose single sample copy is current
+    Transition(*ds->res, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
+}
+
 // src readable: SMAA's blend of it, null when it can't run
 Image* VulkanBackend::Smaa(Image* src, VkFormat fmt, uint32_t w, uint32_t h) {
     static const std::string hlsl = std::string(kSmaaConfig) + kSmaaHlsl + kSmaaPasses;
@@ -4957,6 +5846,8 @@ void VulkanBackend::ClearBars(Image& bb, const FramePlace& p, const VkClearColor
     ca.colorAttachment = 0;
     ca.clearValue.color = colour;
     SetScissor({0, 0, int32_t(bb.w), int32_t(bb.h)});
+    for (uint32_t i = 0; i < n; i++) Touch(rs[i].rect);
+    pass_.drawn = true;
     vkCmdClearAttachments(cl_, 1, &ca, n, rs);
 }
 
@@ -5061,6 +5952,8 @@ void VulkanBackend::RenderUi() {
     ImDrawData* dd = ImGui::GetDrawData();
     if (!dd || !dd->CmdListsCount) return;
     EnsureRendering();
+    pass_.drawn = true;
+    TouchAll();  // ImGui sets its own scissors
     ImGui_ImplVulkan_RenderDrawData(dd, cl_);
     ForgetState();
 }
@@ -5072,7 +5965,8 @@ void VulkanBackend::StartCapture() {
     std::strftime(stamp, sizeof(stamp), "%H%M%S", std::localtime(&now));
     std::error_code ec;
     // one capture at a time: drop the earlier ones (folders holding a frame.txt), nothing else in the folder
-    std::filesystem::path root = app::ExeDir() / diag::CaptureDir();
+    // in the game's folder, where adb and a file manager reach it; the app's own storage is closed to both
+    std::filesystem::path root = (host::GameDir().empty() ? app::ExeDir() : host::GameDir()) / diag::CaptureDir();
     for (const auto& e : std::filesystem::directory_iterator(root, ec))
         if (e.is_directory(ec) && std::filesystem::exists(e.path() / "frame.txt", ec)) std::filesystem::remove_all(e.path(), ec);
     cap_dir_ = std::filesystem::weakly_canonical(root / stamp, ec);
@@ -5133,7 +6027,9 @@ void VulkanBackend::ResetFrame() {
         WaitFence(f.fence);
         g_perf.wait += PerfMs(perf_wait);
     }
+    CrumbCheck(f, "frame");
     vkResetCommandPool(dev_, f.pool, 0);
+    f.pass_at = 0;
     ResetPools(f);
     f.garbage.clear();
     f.garbage_buffers.clear();
@@ -5143,6 +6039,128 @@ void VulkanBackend::ResetFrame() {
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     vkBeginCommandBuffer(cl_, &bi);
     Begin();
+    CrumbBegin();
+}
+
+// the barrier before a breadcrumb: every command recorded before it has finished, not merely started
+void CrumbBarrier(VkCommandBuffer cl) {
+    VkMemoryBarrier m{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    m.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
+    m.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    vkCmdPipelineBarrier(cl, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &m, 0, nullptr,
+                         0, nullptr);
+}
+
+// the frame's command buffer has just begun: its number, and no passes done
+void VulkanBackend::CrumbBegin() {
+    Crumbs& c = CurrentFrame().crumbs;
+    c.seq = 0;
+    c.detail = false;
+    c.passes = 0;
+    c.notes.clear();
+    if (!c.buf) {
+        c.buf = CreateBuffer(16, VK_BUFFER_USAGE_TRANSFER_DST_BIT, true);
+        if (!c.buf) return;
+    }
+    if (++crumb_seq_ == 0) ++crumb_seq_;  // 0 is none
+    c.seq = crumb_seq_;
+    c.detail = crumb_detail_ != 0;
+    c.overflow_at = g_perf.overflow;
+    vkCmdFillBuffer(cl_, c.buf->buffer, 0, 4, c.seq);
+    vkCmdFillBuffer(cl_, c.buf->buffer, 8, 4, 0);
+}
+
+// the last command before the command buffer ends: its number again, once everything before it is done
+void VulkanBackend::CrumbEnd() {
+    Frame& f = CurrentFrame();
+    Crumbs& c = f.crumbs;
+    if (!c.seq) return;
+    CrumbBarrier(cl_);
+    vkCmdFillBuffer(cl_, c.buf->buffer, 4, 4, c.seq);
+    HostReadBarrier();
+    c.used = f.used;
+    // LogPerf starts g_perf over each second
+    c.overflows = g_perf.overflow >= c.overflow_at ? g_perf.overflow - c.overflow_at : g_perf.overflow;
+}
+
+// a pass ended (EndRendering): counted on the GPU once it is done; one with nothing drawn is never begun
+void VulkanBackend::CrumbPass(bool executed) {
+    Crumbs& c = CurrentFrame().crumbs;
+    if (!c.seq || !c.detail) return;
+    if (!executed) {
+        if (!c.notes.empty()) c.notes.pop_back();
+        return;
+    }
+    c.passes++;
+    CrumbBarrier(cl_);
+    vkCmdFillBuffer(cl_, c.buf->buffer, 8, 4, c.passes);
+}
+
+// the draw just recorded, in the open pass's note; null for one of the renderer's own full screen passes
+void VulkanBackend::CrumbNote(const Assembled* a) {
+    Crumbs& c = CurrentFrame().crumbs;
+    if (!c.detail || !rendering_ || c.notes.empty()) return;
+    constexpr size_t kMostDraws = 1024;
+    std::vector<DrawNote>& draws = c.notes.back().draws;
+    if (draws.size() >= kMostDraws) return;
+    DrawNote n = crumb_draw_;
+    n.pso = (uint64_t)bound_.pso;
+    if (a) {
+        for (uint32_t i = 0; i < a->buffer_count; i++) n.vbytes += a->buffers[i].bytes;
+        n.indices = a->index_count;
+        n.draws = a->draw_count;
+    } else {
+        n.count = 3;
+    }
+    draws.push_back(n);
+}
+
+// f's submission is done on the GPU (its fence passed): a report when its last breadcrumb is missing
+void VulkanBackend::CrumbCheck(Frame& f, const char* what) {
+    Crumbs& c = f.crumbs;
+    const uint32_t seq = c.seq;
+    c.seq = 0;
+    if (!seq || !c.buf || device_lost_) return;
+    vmaInvalidateAllocation(vma_, c.buf->alloc, 0, VK_WHOLE_SIZE);
+    uint32_t v[3];
+    std::memcpy(v, c.buf->map, sizeof(v));
+    if (v[1] == seq) return;
+    crumb_drops_++;
+    const bool counted = c.detail;
+    crumb_detail_ = 600;  // the next 600 presents count their passes, so a drop that comes again is named
+    if (crumb_reports_ >= 40) return;
+    const bool full = crumb_reports_ < 3;  // every draw of the pass for the first few, then the pass alone
+    crumb_reports_++;
+    const bool begun = v[0] == seq;
+    LOGDIAG("gpu: %s submission %u at present %llu was dropped by the GPU (%s; its picture never reached the screen): "
+            "%llu upload ring overflows, %.1f MB of the ring used; %u dropped so far",
+            what, seq, (unsigned long long)presents_, begun ? "begun, never finished" : "never begun",
+            (unsigned long long)c.overflows, c.used / 1048576.0, crumb_drops_);
+    if (!counted) {
+        LOGDIAG("gpu: passes are counted from here on: the next dropped submission names the pass it stopped in");
+        return;
+    }
+    const uint32_t done = begun ? v[2] : 0;
+    if (done >= c.notes.size()) {
+        LOGDIAG("gpu: all %zu passes done: it stopped after the last one (a copy, resolve or read-back, or the end)",
+                c.notes.size());
+        return;
+    }
+    const PassNote& p = c.notes[done];
+    LOGDIAG("gpu: %u of %zu passes done; stopped in pass %u or the copies just before it: rt %08X %ux%u format %u, "
+            "%u samples%s, %zu draws",
+            done, c.notes.size(), done, p.rt, p.w, p.h, p.format, p.samples, p.depth ? ", depth" : "", p.draws.size());
+    if (!full) return;
+    for (size_t i = 0; i < p.draws.size(); i++) {
+        const DrawNote& d = p.draws[i];
+        if (!d.prim) {
+            LOGDIAG("gpu:   %zu: full screen pass, pso %llx", i, (unsigned long long)d.pso);
+            continue;
+        }
+        LOGDIAG("gpu:   %zu: rt %08X vs %08X prim %u count %u tex0 %08X | %u vertex bytes, %u indices, %u unindexed, "
+                "pso %llx",
+                i, d.rt, d.vs, d.prim, d.count, d.tex0, d.vbytes, d.indices, d.draws, (unsigned long long)d.pso);
+    }
 }
 
 void VulkanBackend::CountFps() {
@@ -5170,7 +6188,7 @@ void LogPerf() {
              n * 1000.0 / el, el / n, host / n, p.draw / n, p.assemble / n, p.bind / n, p.sig / n, p.texup / n,
              p.compile / n, p.clear / n, p.copy / n, p.sync / n, p.present / n, p.swap / n, p.wait / n,
              (el - host) / n);
-        LOGI("perf: title thread per frame: recording %.2f ms, waiting %.2f ms (%.1f waits: read-back %.2f resource %.2f fence %.2f "
+        LOGR("perf: title thread per frame: recording %.2f ms, waiting %.2f ms (%.1f waits: read-back %.2f resource %.2f fence %.2f "
              "flush %.2f copy %.2f, next frame %.2f) | read-backs waited for: %.1f lock, %.1f NOOVERWRITE",
              g_perf_capture_ns.exchange(0) / n / 1e6, g_perf_wait_ns.exchange(0) / n / 1e6,
              g_perf_waits.exchange(0) / n, g_perf_wait_kind_ns[0].exchange(0) / n / 1e6,
@@ -5178,7 +6196,7 @@ void LogPerf() {
              g_perf_wait_kind_ns[3].exchange(0) / n / 1e6, g_perf_wait_kind_ns[4].exchange(0) / n / 1e6,
              g_perf_wait_kind_ns[5].exchange(0) / n / 1e6, g_perf_sync_block.exchange(0) / n,
              g_perf_sync_late.exchange(0) / n);
-        LOGI("perf: per frame %.0f draws (%.0f raw) %.0fk verts %.1f MB upload %.1f overflow | %.0f checks %.2f MB hashed | %.1f tex uploads "
+        LOGR("perf: per frame %.0f draws (%.0f raw) %.0fk verts %.1f MB upload %.1f overflow | %.0f checks %.2f MB hashed | %.1f tex uploads "
              "%.2f MB, %.1f new tex, %.1f new targets, %.1f target uploads, %.1f shrinks, %.1f read-backs %.1f late | %llu shaders %llu psos this second",
              p.draws / n, p.raw / n, p.verts / n / 1000.0, p.upload / n / 1048576.0, p.overflow / n, p.sigs / n,
              p.sig_bytes / n / 1048576.0, p.texups / n, p.texup_bytes / n / 1048576.0, p.newtex / n,
@@ -5190,9 +6208,80 @@ void LogPerf() {
     }
 }
 
+// A frame far over the usual is written up in cgt.log in the game's folder, where a player finds it to send: what that
+// frame did that others do not, from the perf counters, which run whether or not XBE_PERF logs them. Shaders and
+// pipelines made mean a first sight of an effect (the warm list has it from the next run on); read-backs, a texture
+// the CPU touched after the GPU drew it, and each waits for the GPU; none of it, the title's own code took the time.
+// The surfaces read back are named, the tell of an effect that paints into a texture (blood on a character).
+// Kept to a few dozen a run; a gap of seconds is a load or a pause, not a hitch
+// The last presents, for a report (SAVE REPORT): per frame the title's tick, the surface shown and the draws into it,
+// a hash of the camera (the view and projection transforms, and c0-c7 of the first draw to a shown surface) and the
+// swap chain image. A picture that loops while the tick runs on and the camera hashes change is the display showing
+// old images; hashes that loop with it are the title drawing the same frames again
+struct FrameNote {
+    uint64_t present;
+    uint32_t tick, front, draws, shown_draws, skips, image;
+    int acquire, result;
+    bool lost;
+    uint64_t view, consts;
+};
+constexpr int kFrameNotes = 180;
+FrameNote g_frame_notes[kFrameNotes];
+uint64_t g_frame_note_count = 0;
+std::mutex g_frame_note_lock;
+
+void NoteFrame(const FrameNote& n) {
+    std::lock_guard lock(g_frame_note_lock);
+    g_frame_notes[g_frame_note_count++ % kFrameNotes] = n;
+}
+
+uint32_t g_hitch_reads[4];  // the frame's read-back surfaces (Sync)
+uint32_t g_hitch_read_count = 0;
+
+void NoteHitch(uint64_t frame) {
+    using clock = std::chrono::steady_clock;
+    static clock::time_point last = clock::now();
+    static Perf before;
+    static double average = 33.0;
+    static int reports = 0;
+    auto now = clock::now();
+    double ms = std::chrono::duration<double, std::milli>(now - last).count();
+    last = now;
+    const Perf& p = g_perf;
+    if (p.draws < before.draws) before = Perf{};  // LogPerf started its second over
+    // the title's side, taken each frame: the longest the sound mixer held the lock its calls wait on, and the time
+    // its file reads took. A slow frame the renderer spent little of is the title's, and these tell which
+    double mix_ms = audio::TakeMixMaxUs() / 1000.0;
+    double read_ms = kernel::TakeReadNs() / 1e6;
+    bool hitch = frame > 120 && ms > 50.0 && ms > average * 2.5 && ms < 2000.0 && host::Foreground();
+    if (hitch && reports < 40) {
+        reports++;
+        char reads[64] = "";
+        int at = 0;
+        for (uint32_t i = 0; i < std::min(g_hitch_read_count, 4u) && at < 56; i++)
+            at += std::snprintf(reads + at, sizeof(reads) - size_t(at), " %08X", g_hitch_reads[i]);
+        LOGDIAG("hitch: frame %llu took %.0f ms (usual %.0f): %llu shaders %.0f ms, %llu pipelines, %llu read-backs%s "
+             "%.0f ms, %llu tex uploads %.2f MB %.0f ms, %llu new tex, %llu new targets, %.0f ms copies, %llu draws "
+             "%.0f ms, GPU wait %.0f ms, %llu draws deferred | title: sound mix held %.1f ms, file reads %.1f ms",
+             (unsigned long long)frame, ms, average, (unsigned long long)(p.shaders - before.shaders),
+             p.compile - before.compile, (unsigned long long)(p.psos - before.psos),
+             (unsigned long long)(p.syncs - before.syncs), reads, p.sync - before.sync,
+             (unsigned long long)(p.texups - before.texups), (p.texup_bytes - before.texup_bytes) / 1048576.0,
+             p.texup - before.texup, (unsigned long long)(p.newtex - before.newtex),
+             (unsigned long long)(p.targets - before.targets), p.copy - before.copy,
+             (unsigned long long)(p.draws - before.draws), p.draw - before.draw, p.wait - before.wait,
+             (unsigned long long)(p.deferred - before.deferred), mix_ms, read_ms);
+    }
+    // the usual frame follows slowly and leaves the hitches out
+    if (ms < 2000.0 && !hitch) average += (ms - average) * 0.05;
+    before = p;
+    g_hitch_read_count = 0;
+}
+
 // the frame's commands, then the swap chain image they drew to the screen
 void VulkanBackend::SubmitPresent(bool acquired, uint32_t bi) {
     EndRendering();
+    CrumbEnd();
     vkEndCommandBuffer(cl_);
     uint64_t value = ++fence_value_;
     uint64_t values[2] = {value, 0};
@@ -5205,7 +6294,10 @@ void VulkanBackend::SubmitPresent(bool acquired, uint32_t bi) {
     ts.pWaitSemaphoreValues = &wait_value;
     ts.signalSemaphoreValueCount = acquired ? 2 : 1;
     ts.pSignalSemaphoreValues = values;
-    VkPipelineStageFlags stage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+    // Only what writes the swap chain image waits for it (Transition's source stages for it match): the frame's
+    // scene, recorded before the image was acquired, starts on the GPU at once rather than after the display hands an
+    // image back
+    VkPipelineStageFlags stage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT;
     VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO, timeline_ ? &ts : nullptr};
     si.waitSemaphoreCount = acquired ? 1 : 0;
     si.pWaitSemaphores = &CurrentFrame().acquired;
@@ -5215,14 +6307,11 @@ void VulkanBackend::SubmitPresent(bool acquired, uint32_t bi) {
     si.pCommandBuffers = cmds;
     si.signalSemaphoreCount = (acquired ? 2 : 1) - first;
     si.pSignalSemaphores = signal + first;
-    if (timeline_) {
-        VK_CHECK(vkQueueSubmit(queue_, 1, &si, VK_NULL_HANDLE));
-    } else {
-        std::lock_guard lock(fence_lock_);
-        VK_CHECK(vkQueueSubmit(queue_, 1, &si, SubmitFence(value)));
-    }
+    bool submitted = QueueSubmit(si, value);
     CurrentFrame().fence = fence_value_;
-    if (!acquired) return;
+    if (!submitted) CurrentFrame().crumbs.seq = 0;
+    // a failed submit signals nothing: a present waiting on its semaphore would never be shown
+    if (!acquired || !submitted) return;
     VkPresentInfoKHR pi{VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
     pi.waitSemaphoreCount = 1;
     pi.pWaitSemaphores = &rendered_[bi];
@@ -5240,6 +6329,12 @@ void VulkanBackend::SubmitPresent(bool acquired, uint32_t bi) {
 
 void VulkanBackend::Present(const Surface& front) {
     PerfScope perf_present{g_perf.present};
+    EndShadowFrame();
+    // a phone has no F3 and adb cannot signal the app: capture.now in the game's folder asks for a capture
+    if (!cap_ && presents_ % 30 == 0 && !host::GameDir().empty()) {
+        std::error_code ec;
+        if (std::filesystem::remove(host::GameDir() / "capture.now", ec)) g_capture = true;
+    }
     if (cap_) {
         FinishCapture(front);
     } else if (g_capture.exchange(false) && CaptureOn()) {
@@ -5251,13 +6346,17 @@ void VulkanBackend::Present(const Surface& front) {
     const bool front_ok = host::Foreground();
     if (front_ok && presents_ % 60 == 0) UpdateHdrDisplay();
     // the cache on disk is only as good as the last write: Android may end the process without a destructor
-    if (presents_ % 600 == 0) SaveShaderCaches();  // about every 10 s, what was compiled since
+    if (presents_ % 600 == 0) SaveCachesInBackground();  // about every 10 s, what was met since
     if (front_ok) {
         host::NoteRenderPhase("resize swap");
         ResizeSwap();
     }
     Target* t = EnsureTarget(front, false);
-    if (t && LatchCpuWrite(*t)) UploadTarget(*t, front);
+    if (!Shown(front.data)) {
+        shown_data_[shown_at_] = front.data;
+        shown_at_ = (shown_at_ + 1) % kFrames;
+    }
+    if (t && CpuWrote(*t)) UploadTarget(*t, front);
     if (ramp_dirty_) UploadGammaRamp();
     Transition(*lut_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
 
@@ -5277,12 +6376,20 @@ void VulkanBackend::Present(const Surface& front) {
     host::NotePresent(acquire_result_, present_result_,
                       acquired && (present_result_ == VK_SUCCESS || present_result_ == VK_SUBOPTIMAL_KHR));
 
+    NoteFrame({.present = presents_, .tick = kernel::TickCount(), .front = front.data, .draws = frame_draws_,
+               .shown_draws = frame_shown_draws_, .skips = frame_skips_, .image = acquired ? bi : 0xFFu,
+               .acquire = acquire_result_, .result = present_result_, .lost = device_lost_.load(),
+               .view = frame_view_, .consts = frame_consts_});
+    frame_draws_ = frame_shown_draws_ = frame_skips_ = 0;
+    frame_view_ = frame_consts_ = 0;
+    if (crumb_detail_) crumb_detail_--;
     presents_++;
     presents_seen_.store(presents_);
     frame_++;
     ReleaseOldTextures();
     ResetFrame();
     CountFps();
+    NoteHitch(presents_);
     if (diag::Perf()) LogPerf();
     ApplySettings();
 }
@@ -5305,6 +6412,36 @@ void VulkanBackend::ApplySettings() {
 }
 
 
+// Shadows, light by light. Each light near the player casts the player's and the squad's shadows in a block of its
+// own: the shadow map (a depth target whose colour target is the game's dummy at address 0, nothing reads it) is
+// cleared and the casters drawn into it, then the scene is drawn again reading it, (1 - lit) * colour blended as
+// dest * (1 - src), darkening it where the light is blocked. Two lights in a room gave the player two shadows, and in
+// a firefight muzzle flashes and impacts are lights too, each block a blended re-draw of the scene round the player.
+// Past the frame's first block (the game's first light, its main one), or every block with SHADOWS off, the map
+// and its re-draw are left out: the scene is drawn as if nothing blocked that light.
+bool VulkanBackend::SkipShadow(const State& s) {
+    uint32_t most = game::Opt().shadows ? 1 : 0;
+    if (s.zs.header && (!s.rt.header || !s.rt.data)) {
+        if (!in_shadow_map_) shadow_light_++;  // a map again after other drawing: the next light's
+        in_shadow_map_ = true;
+        shadow_maps_.insert(TargetMapKey(mem::VirtualFromPhysical(s.zs.data), true));
+        return shadow_light_ > most;
+    }
+    in_shadow_map_ = false;
+    if (shadow_light_ <= most || shadow_maps_.empty()) return false;
+    for (uint32_t tex : s.textures) {
+        TextureDesc d;
+        if (tex && Describe(tex, d) && shadow_maps_.count(TargetMapKey(d.data, true))) return true;
+    }
+    return false;
+}
+
+// Present: the lights are counted again for the next frame
+void VulkanBackend::EndShadowFrame() {
+    shadow_light_ = 0;
+    in_shadow_map_ = false;
+}
+
 // the target resolved, then shrunk with o when it is not guest sized BGRA; res null on failure
 VulkanBackend::CopySource VulkanBackend::PrepareCopySource(Target& t, const ShrinkOptions& o) {
     CopySource out{Flat(t), nullptr};
@@ -5323,6 +6460,8 @@ void VulkanBackend::Sync(uint32_t data, uint32_t) {
     if (it == targets_.end() || !it->second.drawn) return;
     PerfScope perf_sync{g_perf.sync};
     g_perf.syncs++;
+    if (g_hitch_read_count < 4) g_hitch_reads[g_hitch_read_count] = data;
+    g_hitch_read_count++;
     if (diag::Perf()) {
         LOG_FIRST(16, "perf: read-back of %08X (%ux%u guest, %ux%u host)", data, it->second.gw, it->second.gh,
                   it->second.w, it->second.h);
@@ -5385,6 +6524,7 @@ bool VulkanBackend::DeliverLate(uint32_t data) {
         uint8_t* dst = static_cast<uint8_t*>(kernel::HostPtr(data));
         for (uint32_t y = 0; y < l.gh; y++) std::memcpy(dst + size_t(y) * pitch, rb.map + size_t(y) * l.gw * 4, l.gw * 4);
         l.delivered = l.fence[best];
+        l.delivered_sig = l.bytes ? GuestSig(data, l.bytes) : 0;
     }
     return true;
 }
@@ -5436,12 +6576,27 @@ void VulkanBackend::RecordLate(uint32_t data) {
         if (diag::Perf()) LOG_FIRST(16, "perf: late %08X ring reset, %ux%u -> %ux%u", data, l.gw, l.gh, t.gw, t.gh);
         ResetLate(l, t);
     }
+    l.bytes = t.bytes;
     // a copy for a later lock, unless the GPU is a whole ring behind
     uint32_t slot = l.next;
     if (l.fence[slot] > CompletedFence()) return;
     Image* src = PrepareLateSource(t, l);
     if (!src) return;
     RecordLateCopy(l, slot, src);
+}
+
+// LatchCpuWrite, except that what DeliverLate put in guest memory is not the CPU's. That copy is a frame or two old:
+// taken for a CPU write, it was uploaded over what the frame had drawn into the target, the next late copy took the
+// old picture up again, and the screen cycled through a few old frames (the HUD's counters with them) for as long as
+// the title kept locking the surface NOOVERWRITE (the first mission's doorway, on a phone slow enough to be behind).
+// Under late_lock_, so DeliverLate does not write the memory while it is hashed
+bool VulkanBackend::CpuWrote(Target& t) {
+    if (DirtyEpoch(t.data) <= t.epoch) return false;
+    std::lock_guard lock(late_lock_);
+    auto it = late_.find(t.data);
+    uint64_t delivered = it != late_.end() ? it->second.delivered_sig : 0;
+    if (!LatchCpuWrite(t)) return false;
+    return !delivered || t.sig != delivered;
 }
 
 // filters src into a w x h BGRA target, new or o.into, left as a copy source
@@ -5463,6 +6618,7 @@ ImageRef VulkanBackend::Shrink(Image* src, uint32_t w, uint32_t h, const ShrinkO
 // a guest sized BGRA image into a buffer, rows packed
 void VulkanBackend::CopyImageToBuffer(Image* src, VkBuffer dst, uint32_t w, uint32_t h) {
     Transition(*src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    EndRendering();
     VkBufferImageCopy c{};
     c.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
     c.imageExtent = {std::min(w, src->w), std::min(h, src->h), 1};
@@ -5577,6 +6733,20 @@ std::unique_ptr<Backend> CreateBackend() {
 
 void WaitGpuFrame(uint64_t n) {
     if (g_vulkan) g_vulkan->WaitGpuFrame(n);
+}
+
+// SAVE REPORT: the frame history into cgt.log, oldest first; any thread
+void LogFrameHistory() {
+    std::lock_guard lock(g_frame_note_lock);
+    uint64_t first = g_frame_note_count > kFrameNotes ? g_frame_note_count - kFrameNotes : 0;
+    LOGDIAG("frames: last %llu presents: present tick front draws(shown/skipped) image acquire result lost | view consts",
+         (unsigned long long)(g_frame_note_count - first));
+    for (uint64_t i = first; i < g_frame_note_count; i++) {
+        const FrameNote& n = g_frame_notes[i % kFrameNotes];
+        LOGDIAG("frames: %llu %u %08X %u(%u/%u) %u %d %d %d | %08X %08X", (unsigned long long)n.present, n.tick, n.front,
+             n.draws, n.shown_draws, n.skips, n.image, n.acquire, n.result, int(n.lost), uint32_t(n.view),
+             uint32_t(n.consts));
+    }
 }
 
 }  // namespace gpu

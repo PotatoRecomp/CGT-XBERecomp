@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cerrno>
 #include <cstring>
 
 #ifdef _WIN32
@@ -71,8 +72,17 @@ uint32_t Disc::ReadAt(uint64_t at, void* out, uint32_t len) const {
     if (!GetOverlappedResult(HANDLE(file_), &o, &got, TRUE)) return 0;
     return got;
 #else
-    ssize_t got = pread(int(file_), out, len, off_t(at));
-    return got > 0 ? uint32_t(got) : 0;
+    // pread may hand back less than asked before the end (FUSE, which serves Android's shared storage and cards) or
+    // fail with EINTR: read on until the length or the end. Taken as it came, a file arrived cut short and the title
+    // was told the read succeeded: the DSP image short and the sound start crashed on its missing effects
+    uint32_t done = 0;
+    while (done < len) {
+        ssize_t got = pread(int(file_), static_cast<uint8_t*>(out) + done, len - done, off_t(at + done));
+        if (got < 0 && errno == EINTR) continue;
+        if (got <= 0) break;
+        done += uint32_t(got);
+    }
+    return done;
 #endif
 }
 

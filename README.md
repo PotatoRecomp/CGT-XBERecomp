@@ -12,8 +12,8 @@ This port was created using the [Xbox XBE Recomp](https://github.com/TGP482/Xbox
 
 ## Settings
 Press **F10** in game to open the recomp settings (F10 or Esc closes them, which saves `settings.toml`). They cover the recomp's general settings only; the game's own options stay in its menus. While the panel is open the game gets no input, and the keyboard or controller works the panel.
-- **Display:** display mode, vertical sync, max frame rate, game frame rate (30 as on the console, or 60), render resolution, FPS counter.
-- **Graphics:** MSAA, SMAA, FXAA, anisotropic filtering, bloom, fog, and HDR output on displays with HDR on.
+- **Display:** display mode, vertical sync, max frame rate, game frame rate (30 as on the console, or 60), frame skip (frames left undrawn while the drawing falls behind the game, at most two in a row), render resolution, FPS counter.
+- **Graphics:** MSAA, SMAA, FXAA, anisotropic filtering, bloom, fog, shadows, and HDR output on displays with HDR on. The game casts the player's shadow from every light nearby; only the frame's first light casts one (SHADOWS off leaves it out too), so two lights don't give two shadows and muzzle flashes don't redraw the scene in firefights.
 - **Controls:** mouse look, mouse sensitivity, mouse invert Y.
 - **Audio:** volume, 50% to 400%, 200% by default. The game mixes for a TV turned up (its effects at -12.5 dB, music at -20 dB, every mix bin 6 dB lower again for headroom), which on a PC sounds almost silent; 200% gives the headroom back.
 - **Screen filter** (from MostWanted-Android): Sharpen, Vivid, Scanlines, CRT and HDR Look, applied at the present.

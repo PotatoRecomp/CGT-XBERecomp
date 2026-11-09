@@ -95,6 +95,19 @@ void LogSettings() {
         if (!line.empty()) LOGR("  %s", line.c_str());
 }
 
+std::string SettingsLine() {
+    std::ostringstream text;
+    text << Table();
+    std::istringstream lines(text.str());
+    std::string out;
+    for (std::string line; std::getline(lines, line);) {
+        if (line.empty()) continue;
+        if (!out.empty()) out += ", ";
+        out += line;
+    }
+    return out;
+}
+
 #ifdef _WIN32
 // Linux: main_linux.cpp's, from SDL
 Mode Desktop() {

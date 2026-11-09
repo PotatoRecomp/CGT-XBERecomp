@@ -114,6 +114,7 @@ enum MixBin : uint32_t {
 };
 constexpr uint32_t kBins = dsp::kBins;
 constexpr uint32_t kInvalidCall = 0x88780032u;  // DSERR_INVALIDCALL
+constexpr uint32_t kFail = 0x80004005u;         // E_FAIL
 constexpr uint32_t kMaxChannels = 8;
 // rows of a voice's mix: its channels, then a mono 3D voice's two ears
 constexpr uint32_t kLeftEar = kMaxChannels;
@@ -720,10 +721,21 @@ void MixVoice(Voice& v, float* bins, uint32_t frames) {
     v.itd = itd;
 }
 
+std::atomic<uint32_t> g_mix_max_us{0};
+
 void Render(float* out, uint32_t frames) {
     static std::vector<float> bins;  // the output thread alone renders
     bins.assign(size_t(frames) * kBins, 0.0f);
     std::lock_guard<std::recursive_mutex> lock(g_lock);
+    // how long the lock is held, the voices and the effects mixed, for a hitch report
+    struct Held {
+        std::chrono::steady_clock::time_point at = std::chrono::steady_clock::now();
+        ~Held() {
+            auto us = uint32_t(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - at).count());
+            uint32_t was = g_mix_max_us.load(std::memory_order_relaxed);
+            while (us > was && !g_mix_max_us.compare_exchange_weak(was, us, std::memory_order_relaxed)) {}
+        }
+    } held;
     if (g_slog) {  // TMPDBG four times a second, the buffers playing
         static uint32_t blocks = 0;
         if (blocks++ % std::max<uint32_t>(audio::kRate / 4 / std::max<uint32_t>(frames, 1), 1) == 0)
@@ -1098,6 +1110,13 @@ static uint32_t EffectsDesc(const std::vector<uint8_t>& img, const char* name, u
     auto u32 = [&](size_t o) { uint32_t v = 0; if (o + 4 <= img.size()) std::memcpy(&v, &img[o], 4); return v; };
     size_t t = XDK_EffectsImage_Desc + size_t(u32(XDK_EffectsImage_Skip0) + u32(XDK_EffectsImage_Skip1)) * 4;
     uint32_t count = std::min<uint32_t>(u32(t), 64);
+    // An image cut short (a read that stopped early) has no effect list to give: refused, as the console's
+    // DirectSound refuses a bad image, rather than a descriptor of no effects the title then reads as present
+    if (!count || t + 8 + size_t(count) * 32 > img.size()) {
+        LOGE("dsound: effects image %s is %zu bytes, too short for its effect list: the game's file is damaged or "
+             "was not read whole", name, img.size());
+        return 0;
+    }
     LOGI("dsound: effects image %s, %u effects", name, count);
     uint32_t desc = mem::AllocSystem(8 + std::max(count, 1u) * 32);
     W32(desc, count);
@@ -1138,7 +1157,7 @@ HLE_STDCALL(XAudioDownloadEffectsImage, 4) {
     }
     uint32_t desc = EffectsDesc(img, name.c_str(), a[1]);
     if (a[3]) W32(a[3], desc);
-    return 0;
+    return desc ? 0 : kFail;
 }
 
 // (this, image, size, location, descriptor out): the title loaded the image itself
@@ -1146,7 +1165,7 @@ HLE_STDCALL(IDirectSound_DownloadEffectsImage, 5) {
     std::vector<uint8_t> img(static_cast<uint8_t*>(HostPtr(a[1])), static_cast<uint8_t*>(HostPtr(a[1])) + a[2]);
     uint32_t desc = EffectsDesc(img, "from memory", a[3]);
     if (a[4]) W32(a[4], desc);
-    return 0;
+    return desc ? 0 : kFail;
 }
 // (this, effect, offset, data, size): reads the effect's state
 HLE_STDCALL(IDirectSound_GetEffectData, 5) {
@@ -1594,3 +1613,5 @@ HLE_STDCALL(DSound_B0080, 4) {
     Run(ctx, flushed);  // the flushed packets' callbacks, outside the lock as the stream methods run them
     return r;
 }
+
+uint32_t audio::TakeMixMaxUs() { return g_mix_max_us.exchange(0, std::memory_order_relaxed); }

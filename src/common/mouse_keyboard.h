@@ -26,5 +26,6 @@ namespace game {
 
 void PadHook(int port, input::Pad& p);  // GameInfo::pad
 bool Event(const void* sdl_event);      // GameInfo::event
+void LogLookHistory();                  // game/hooks.cpp: the player's look, frame by frame, for a report
 
 }  // namespace game

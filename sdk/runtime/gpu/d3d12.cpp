@@ -276,17 +276,22 @@ constexpr uint32_t kSigWholeMax = 65536;
 constexpr uint32_t kSigSamples = 64;
 constexpr uint32_t kSigSampleBytes = 64;
 
-uint64_t MemSig(uint32_t data, uint32_t total) {
+// MemSig's hash alone: DeliverLate runs on the title's thread, and g_perf is the render thread's
+uint64_t GuestSig(uint32_t data, uint32_t total) {
     const uint8_t* p = static_cast<const uint8_t*>(kernel::HostPtr(data));
     uint64_t sig = Hash(&total, sizeof(total));
-    g_perf.sigs++;
-    g_perf.sig_bytes += total <= kSigWholeMax ? total : kSigSamples * kSigSampleBytes;
     if (total <= kSigWholeMax) return Hash(p, total, sig);
     for (uint32_t i = 0; i < kSigSamples; i++) {
         const uint8_t* sample = p + uint64_t(total - kSigSampleBytes) * i / (kSigSamples - 1);
         sig = Hash(sample, kSigSampleBytes, sig);
     }
     return sig;
+}
+
+uint64_t MemSig(uint32_t data, uint32_t total) {
+    g_perf.sigs++;
+    g_perf.sig_bytes += total <= kSigWholeMax ? total : kSigSamples * kSigSampleBytes;
+    return GuestSig(data, total);
 }
 
 // MemSig samples a big surface and misses small writes (XFONT text): after a Sync every byte is compared
@@ -628,6 +633,7 @@ private:
     // RecordLate's steps, under late_lock_
     struct Late;
     void ResetLate(Late& l, const Target& t);
+    bool CpuWrote(Target& t);
     ID3D12Resource* PrepareLateSource(Target& t, Late& l);
     void RecordLateCopy(Late& l, uint32_t slot, ID3D12Resource* src);
 
@@ -701,6 +707,8 @@ private:
         uint64_t fence[kFrames] = {};
         uint64_t frame[kFrames] = {};
         uint64_t delivered = 0;
+        uint64_t delivered_sig = 0;  // GuestSig of the copy DeliverLate last wrote to guest memory, 0 for none
+        uint32_t bytes = 0;          // the target's guest bytes, what GuestSig hashes
         uint32_t gw = 0;
         uint32_t gh = 0;
         uint32_t row_pitch = 0;
@@ -1109,7 +1117,7 @@ bool D3D12Backend::BindTargets(const State& s) {
     if (rt && ds && (rt->w != ds->w || rt->h != ds->h)) ds = nullptr;
     if (!rt && !ds) return false;
     if (rt) {
-        if (LatchCpuWrite(*rt)) UploadTarget(*rt, s.rt);
+        if (CpuWrote(*rt)) UploadTarget(*rt, s.rt);
         Transition(rt->res.Get(), rt->state, D3D12_RESOURCE_STATE_RENDER_TARGET);
         rt->drawn = true;
     }
@@ -1576,7 +1584,7 @@ ID3D12Resource* D3D12Backend::BindTargetTexture(const State& s, int stage, const
     bool feedback = &t == draw_rt_;
     stages.rt[stage] = true;
     info.flags |= kTexTarget;
-    if (!t.depth && LatchCpuWrite(t)) {
+    if (!t.depth && CpuWrote(t)) {
         Surface su;
         su.header = s.textures[size_t(stage)];
         UploadTarget(t, su);
@@ -2556,7 +2564,7 @@ void D3D12Backend::ClearTarget(Target& t, const State& s, const ClearArgs& c, st
                                    UINT8(c.stencil), UINT(rs.size()), rs.data());
     } else {
         // pixels the CPU wrote before this clear go in first, a later upload would paint over the clear
-        if (LatchCpuWrite(t)) UploadTarget(t, s.rt);
+        if (CpuWrote(t)) UploadTarget(t, s.rt);
         Transition(t.res.Get(), t.state, D3D12_RESOURCE_STATE_RENDER_TARGET);
         float col[4];
         Color(c.color, col);
@@ -2970,7 +2978,7 @@ void D3D12Backend::Present(const Surface& front) {
     }
     ResizeSwap();
     Target* t = EnsureTarget(front, false);
-    if (t && LatchCpuWrite(*t)) UploadTarget(*t, front);
+    if (t && CpuWrote(*t)) UploadTarget(*t, front);
     if (t) Resolve(*t);
     if (ramp_dirty_) UploadGammaRamp();
     Transition(lut_.Get(), lut_state_, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
@@ -3093,6 +3101,7 @@ bool D3D12Backend::DeliverLate(uint32_t data) {
         D3D12_RANGE none{0, 0};
         l.rb[best]->Unmap(0, &none);
         l.delivered = l.fence[best];
+        l.delivered_sig = l.bytes ? GuestSig(data, l.bytes) : 0;
     }
     return true;
 }
@@ -3161,12 +3170,27 @@ void D3D12Backend::RecordLate(uint32_t data) {
         if (diag::Perf()) LOG_FIRST(16, "perf: late %08X ring reset, %ux%u -> %ux%u", data, l.gw, l.gh, t.gw, t.gh);
         ResetLate(l, t);
     }
+    l.bytes = t.bytes;
     // a copy for a later lock, unless the GPU is a whole ring behind
     uint32_t slot = l.next;
     if (l.fence[slot] > fence_->GetCompletedValue()) return;
     ID3D12Resource* src = PrepareLateSource(t, l);
     if (!src) return;
     RecordLateCopy(l, slot, src);
+}
+
+// LatchCpuWrite, except that what DeliverLate put in guest memory is not the CPU's. That copy is a frame or two old:
+// taken for a CPU write, it was uploaded over what the frame had drawn into the target, the next late copy took the
+// old picture up again, and the screen cycled through a few old frames (the HUD's counters with them) for as long as
+// the title kept locking the surface NOOVERWRITE (the first mission's doorway, on a phone slow enough to be behind).
+// Under late_lock_, so DeliverLate does not write the memory while it is hashed
+bool D3D12Backend::CpuWrote(Target& t) {
+    if (DirtyEpoch(t.data) <= t.epoch) return false;
+    std::lock_guard lock(late_lock_);
+    auto it = late_.find(t.data);
+    uint64_t delivered = it != late_.end() ? it->second.delivered_sig : 0;
+    if (!LatchCpuWrite(t)) return false;
+    return !delivered || t.sig != delivered;
 }
 
 // filters src into a new w x h target, left as a copy source

@@ -12,6 +12,9 @@ enum ScreenFilter : uint32_t { kFilterNone, kFilterSharpen, kFilterVivid, kFilte
 struct Options {
     bool bloom = true;        // the glow added over bright parts of the frame
     bool fog = true;
+    bool shadows = true;      // the game's shadow from the frame's main light (renderer SkipShadow)
+    // Android: a new effect's shaders and pipelines made off the render thread, the draw left out a few frames meanwhile
+    bool async_shaders = true;
     uint32_t msaa = 0;        // samples a pixel of the scene, 0 off
     bool smaa = false;        // over the finished frame
     bool fxaa = false;        // at the present, after SMAA
@@ -22,6 +25,7 @@ struct Options {
     // every mix bin 6 dB lower again for headroom; 200 gives that 6 dB back
     uint32_t volume = 200;
     bool frame_rate_60 = false;  // the game's 30 fps pacer run at 60 (game/hooks.cpp)
+    bool frame_skip = false;     // frames left undrawn while the drawing is behind, the game at its speed (render thread)
     // the mouse turns the view by its counts, straight into the game's look angles (game/hooks.cpp)
     bool mouse_look = true;
     bool mouse_invert_y = false;

@@ -506,12 +506,29 @@ HLE_STDCALL(D3D_MakeRequestedSpace, 2) {
 // returns at the next 60 Hz blank, not a fixed time after the call: a title's pacer that waits for blanks until two
 // have passed since its last frame then lands on 30 fps, where a flat 16 ms sleep added to the frame's work gave 25
 // (Conflict: Global Terror, 0x112D2D, which also measures the period by timing two calls)
+namespace d3d {
+namespace {
+constexpr auto kFieldPeriod = std::chrono::nanoseconds(16666667);
+constexpr uint32_t kFieldLines = 525, kShownLines = 480;
+std::chrono::steady_clock::time_point FieldEpoch() {
+    static const std::chrono::steady_clock::time_point epoch = std::chrono::steady_clock::now();
+    return epoch;
+}
+}  // namespace
+
+void RasterStatus(bool& in_vblank, uint32_t& line) {
+    auto phase = (std::chrono::steady_clock::now() - FieldEpoch()) % kFieldPeriod;
+    uint32_t at = uint32_t(uint64_t(phase.count()) * kFieldLines / uint64_t(kFieldPeriod.count()));
+    line = (at + kShownLines) % kFieldLines;  // a grid point is the blank's start, the line after the last shown
+    in_vblank = line >= kShownLines;
+    if (in_vblank) line = 0;
+}
+}  // namespace d3d
+
 HLE_STDCALL(D3DDevice_BlockUntilVerticalBlank, 0) {
     using clock = std::chrono::steady_clock;
-    constexpr auto kPeriod = std::chrono::nanoseconds(16666667);
-    static const clock::time_point epoch = clock::now();
-    auto since = clock::now() - epoch;
-    std::this_thread::sleep_until(epoch + (since / kPeriod + 1) * kPeriod);
+    auto since = clock::now() - FieldEpoch();
+    std::this_thread::sleep_until(FieldEpoch() + (since / kFieldPeriod + 1) * kFieldPeriod);
     return 0;
 }
 HLE_STDCALL(D3DDevice_SetFlickerFilter, 1) { return 0; }

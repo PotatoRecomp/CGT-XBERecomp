@@ -97,6 +97,8 @@ public class CGTActivity extends SDLActivity {
     static native void nativeSettingsSet(int key, int value, boolean commit);
     static native void nativeSettingsDefaults();
     private static native void nativeSettingsOpen(boolean open);
+    // native/main.cpp: SAVE REPORT, the report written into cgt.log in the game's folder; the file's path back
+    static native String nativeSaveReport();
 
     // native/settings_bridge.cpp: true while the game still counts itself in the background, for the resume-freeze
     // recovery in onWindowFocusChanged

@@ -30,6 +30,7 @@ Settings& Get();
 void Load();
 void Save();         // the settings file, as Load reads it
 void LogSettings();  // every setting, as the settings file has them
+std::string SettingsLine();  // the same on one line, "key = value" pairs split by ", "
 void LogSystem();    // the machine and the settings, at a run's start
 void ApplyDisplay();  // any thread
 struct Mode {

@@ -14,6 +14,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <csignal>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
@@ -26,9 +27,15 @@
 #include <imgui.h>
 
 #include "app/app.h"
+#include "common/mouse_keyboard.h"
 #include "core/input.h"
 #include "core/log.h"
 #include "host.h"
+
+namespace gpu {
+void LogFrameHistory();  // native/vulkan.cpp
+}  // namespace gpu
+extern const char kBuildId[];  // build_id.cpp, written by android/build_id.cmake
 #include "image_symbols.h"
 #include "kernel/kernel.h"
 
@@ -159,7 +166,7 @@ void Handle(const SDL_Event& e) {
         case SDL_EVENT_WINDOW_FOCUS_GAINED:
             // the window has the focus only in front: a return SDL's lifecycle did not tell is taken here
             if (!g_foreground) {
-                LOGE("app: the window has the focus while counted in the background: resumed");
+                LOGDIAG("app: the window has the focus while counted in the background: resumed");
                 UpdateSizes();
                 SetForeground(true);
             }
@@ -315,14 +322,15 @@ void LogThreads() {
     const int64_t now =
         std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
     const int64_t in_ns = now - g_render_phase_ns.load(std::memory_order_relaxed);
-    LOGE("freeze: render thread in '%s' for %lld ms, last acquire %d, present %d, surface epoch %u",
+    LOGDIAG("freeze: render thread in '%s' for %lld ms, last acquire %d, present %d, surface epoch %u",
          g_render_phase.load(std::memory_order_relaxed), (long long)(in_ns / 1'000'000), g_acquire_result.load(),
          g_present_result.load(), g_surface_epoch.load());
     for (auto& t : kernel::Threads()) {
         if (!t || !t->ctx) continue;
-        LOGE("freeze: guest thread %X", t->id);
-        kernel::LogGuestStack(*t->ctx, 48);
+        LOGDIAG("freeze: guest thread %X", t->id);
+        kernel::LogGuestStack(*t->ctx, 48, true);
     }
+    kernel::LogRecentFiles();
     std::error_code ec;
     for (const auto& task : std::filesystem::directory_iterator("/proc/self/task", ec)) {
         std::string name, stat, wchan;
@@ -332,8 +340,24 @@ void LogThreads() {
         // the state follows the name in parentheses
         size_t close = stat.rfind(')');
         char state = close != std::string::npos && close + 2 < stat.size() ? stat[close + 2] : '?';
-        LOGE("freeze: native %s (%s) %c %s", task.path().filename().c_str(), name.c_str(), state, wchan.c_str());
+        LOGDIAG("freeze: native %s (%s) %c %s", task.path().filename().c_str(), name.c_str(), state, wchan.c_str());
     }
+}
+
+// SAVE REPORT on the settings panel (SettingsDialog.java): the freeze report on demand, for what sets off no watchdog,
+// a game that goes on drawing but gets nowhere (a load it waits on for ever, frames still swapped) or a drop in frame
+// rate. The overlay's stats, each guest thread's stack, the native threads and the title's last file calls go into
+// cgt.log in the game's folder, where the player finds it to send; the path comes back for the panel to show
+std::string WriteReport() {
+    char stats[256];
+    touch::StatsLine(stats, sizeof(stats));
+    LOGDIAG("report: asked for at swap %llu, %s", (unsigned long long)g_swaps.load(), stats);
+    LOGDIAG("report: settings now %s", app::SettingsLine().c_str());
+    LogThreads();
+    gpu::LogFrameHistory();
+    game::LogLookHistory();
+    logx::Flush();
+    return logx::Path();
 }
 
 void StartFreezeWatchdog() {
@@ -353,7 +377,7 @@ void StartFreezeWatchdog() {
             bool focused = g_window && (SDL_GetWindowFlags(g_window) & SDL_WINDOW_INPUT_FOCUS);
             if (g_foreground || !focused) behind_since = t;
             if (t - behind_since >= std::chrono::seconds(2)) {
-                LOGE("freeze: in front with the input focus but counted in the background for 2 s: resumed");
+                LOGDIAG("freeze: in front with the input focus but counted in the background for 2 s: resumed");
                 SetForeground(true);
                 behind_since = t;
             }
@@ -362,7 +386,7 @@ void StartFreezeWatchdog() {
             bool idle = !g_foreground || g_focus_paused || !now;
             if (now != seen || idle) {
                 if (reported && now != seen) {
-                    LOGE("freeze: the game swaps again at %llu", (unsigned long long)now);
+                    LOGDIAG("freeze: the game swaps again at %llu", (unsigned long long)now);
                     reported = false;
                 }
                 seen = now;
@@ -377,7 +401,7 @@ void StartFreezeWatchdog() {
             // the game swapping and nothing reaching the screen: the picture stands still, the game and its sound go on
             if (now_shown != shown || idle || now == seen) {
                 if (reported_shown && now_shown != shown) {
-                    LOGE("freeze: frames reach the screen again");
+                    LOGDIAG("freeze: frames reach the screen again");
                     reported_shown = false;
                 }
                 shown = now_shown;
@@ -462,6 +486,12 @@ void NotePresent(int acquire, int present, bool shown) {
     if (shown) app::g_shown++;
 }
 
+namespace {
+char g_gpu_name[256] = "";
+}  // namespace
+void SetGpuName(const char* name) { std::snprintf(g_gpu_name, sizeof(g_gpu_name), "%s", name ? name : ""); }
+const char* GpuName() { return g_gpu_name; }
+
 void NoteRenderPhase(const char* phase) {
     app::g_render_phase.store(phase ? phase : "idle", std::memory_order_relaxed);
     app::g_render_phase_ns.store(
@@ -491,6 +521,12 @@ void Toast(const char* text) {
 }
 
 }  // namespace host
+
+// SettingsDialog.java's SAVE REPORT: the report written, the file it went to for the toast
+extern "C" JNIEXPORT jstring JNICALL Java_com_datfooldive_cgt_CGTActivity_nativeSaveReport(JNIEnv* env, jclass) {
+    std::string path = app::WriteReport();
+    return env->NewStringUTF(path.c_str());
+}
 
 namespace {
 
@@ -541,7 +577,7 @@ void InstallCrashHandler() {
 }
 
 // errors and crashes go to cgt.log in the game's folder, beside its files, where a player finds it to send; the header
-// says which phone it came from
+// says which phone, which build and which settings it came from
 void LogToGameFolder(const std::filesystem::path& dir) {
     char model[PROP_VALUE_MAX] = "", maker[PROP_VALUE_MAX] = "", release[PROP_VALUE_MAX] = "", sdk[PROP_VALUE_MAX] = "";
     __system_property_get("ro.product.manufacturer", maker);
@@ -552,13 +588,24 @@ void LogToGameFolder(const std::filesystem::path& dir) {
     char date[32];
     std::strftime(date, sizeof(date), "%Y-%m-%d %H:%M:%S", std::localtime(&now));
     std::string header = app::Utf8(app::kGame.title) + " (Android), " + date + "\n" + maker + " " + model +
-                         ", Android " + release + " (API " + sdk + ")\n";
+                         ", Android " + release + " (API " + sdk + ")\nBuild: " + kBuildId + "\nSettings: " +
+                         app::SettingsLine() + "\n";
     logx::ErrorFile((dir / (std::string(app::kGame.log) + ".log")).string(), header);
 }
 
 }  // namespace
 
+namespace prof {
+void StartIfAsked();  // native/profiler.cpp
+void SetDir(const std::string& dir);
+}  // namespace prof
+
 int main(int, char**) {
+    // an app gets no environment of its own: `adb shell setprop debug.cgt.perf 1` stands in for XBE_PERF, read before
+    // anything asks diag::Perf
+    char perf[PROP_VALUE_MAX] = "";
+    if (__system_property_get("debug.cgt.perf", perf) > 0 && perf[0] != '0') setenv("XBE_PERF", "1", 1);
+    prof::StartIfAsked();
     // SDL sets the activity's orientation from the window it is asked for, over the manifest's sensorLandscape
     SDL_SetHint(SDL_HINT_ORIENTATIONS, "LandscapeLeft LandscapeRight");
     // the screen's fingers are TouchControls.java's: none of them reaches the game as a mouse, and a real mouse's
@@ -591,6 +638,7 @@ int main(int, char**) {
     app::GameFiles game;
     if (!app::FindGame(game)) return 1;
     LogToGameFolder(game.dir);
+    prof::SetDir(game.dir.string());
     InstallCrashHandler();
     if (!app::PrepareGameCode(game)) return 1;
     // the saves go in the game's own folder, beside its files: an uninstall takes the app's folder, not this one

@@ -105,6 +105,22 @@ void HoldGuestClock(bool hold) {
 }
 
 uint32_t g_tick_count_va = 0;
+
+namespace {
+std::chrono::steady_clock::time_point g_tick_start;
+}  // namespace
+
+uint32_t TickCount() {
+    uint32_t now = uint32_t(std::chrono::duration_cast<std::chrono::milliseconds>(GuestNow() - g_tick_start).count());
+    // published into the title's KeTickCount as it is handed out, never lowered: what the title reads from memory is
+    // never behind a count it was given, from here or from the clock thread, so no difference of two comes out negative
+    if (!g_tick_count_va) return now;
+    auto* word = static_cast<uint32_t*>(HostPtr(g_tick_count_va));
+    uint32_t seen = __atomic_load_n(word, __ATOMIC_RELAXED);
+    while (int32_t(now - seen) > 0 &&
+           !__atomic_compare_exchange_n(word, &seen, now, true, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {}
+    return int32_t(now - seen) > 0 ? now : seen;
+}
 uint32_t g_launch_data_page_va = 0;
 
 void InitKernelData() {
@@ -131,15 +147,19 @@ void InitKernelData() {
     W32(queue + 4, queue);
     G<uint8_t>(DataAddress(89)) = 1;
     W32(DataAddress(157), 10000);  // 1 ms in 100 ns units
-    // the start of the clock
+    // the start of the clock. The thread wakes on whole milliseconds of the host clock, not a millisecond after it last
+    // ran: a phone that keeps it from running for a while (a busy little core while the title streams) sees the count
+    // catch up at once rather than every later write land late. A title's own tick reads may go through TickCount
+    // (game/hooks.cpp), which never waits on this thread
+    g_tick_start = GuestNow();
     std::thread([] {
-        auto start = GuestNow();
+        auto next = std::chrono::steady_clock::now();
         for (;;) {
-            auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(GuestNow() - start).count();
-            W32(g_tick_count_va, uint32_t(ms));
+            TickCount();
             PutSystemTime(DataAddress(120), InterruptTime());
             PutSystemTime(DataAddress(154), uint64_t(Now100ns()));
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            next = std::max(next + std::chrono::milliseconds(1), std::chrono::steady_clock::now());
+            std::this_thread::sleep_until(next);
         }
     }).detach();
 }

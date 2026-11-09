@@ -6,15 +6,16 @@
 
 namespace logx {
 
-// a release build writes Report and Error lines only
-enum class Level { Debug, Info, Warn, Error, Report };
+// a release build writes Report, Error and Diag lines only. Diag: what a report or a hitch notes, not an error, kept
+// with the errors (ErrorFile's log takes it too) but not marked as one
+enum class Level { Debug, Info, Warn, Error, Report, Diag };
 
 // release: dir/prefix.log, carried on when append; debug: dir/prefix_NNN.log per run, newest 30 kept
 void Init(const std::string& dir, const std::string& prefix, bool append = false);
 void Write(Level lv, const char* fmt, ...) __attribute__((format(printf, 2, 3)));
 void Flush();
 const std::string& Path();
-// errors alone to path, the file made at a run's first one and header written first: a run with none leaves the last
+// errors (and Diag lines) alone to path, the file made at a run's first one and header written first: a run with none leaves the last
 // one's file as it was (Android: the error log in the game's folder, where a player finds it)
 void ErrorFile(const std::string& path, const std::string& header);
 
@@ -31,6 +32,7 @@ inline constexpr bool kVerbose = true;
 #define LOGW(...) ::logx::Write(::logx::Level::Warn, __VA_ARGS__)
 #define LOGE(...) ::logx::Write(::logx::Level::Error, __VA_ARGS__)
 #define LOGR(...) ::logx::Write(::logx::Level::Report, __VA_ARGS__)
+#define LOGDIAG(...) ::logx::Write(::logx::Level::Diag, __VA_ARGS__)
 
 // logs only the first n times a call site is reached
 #define LOG_FIRST(n, ...)                                  \

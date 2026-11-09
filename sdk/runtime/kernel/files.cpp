@@ -1,5 +1,7 @@
 #include <algorithm>
+#include <atomic>
 #include <cctype>
+#include <cerrno>
 #include <chrono>
 #include <cstdio>
 #include <filesystem>
@@ -88,6 +90,35 @@ struct File : Object {
         }
     }
 };
+
+// The title's last file calls, for a hang report (LogRecentFiles): a title that keeps drawing while it waits on a load
+// shows here the file it opens or reads again and again, and what each read got. A call the same as the one before
+// counts up rather than taking a row, so a loop of retries is one row with its count
+struct FileCall {
+    char op = 0;  // o open, m missing, r read
+    char name[96] = {};
+    uint64_t at = 0;
+    uint32_t asked = 0, got = 0, status = 0, times = 0;
+};
+constexpr uint32_t kFileCalls = 40;
+std::atomic<uint64_t> g_read_ns{0};
+std::mutex g_calls_lock;
+FileCall g_calls[kFileCalls];
+uint32_t g_calls_next = 0;
+
+void NoteCall(char op, const std::string& name, uint64_t at, uint32_t asked, uint32_t got, uint32_t status) {
+    std::lock_guard lock(g_calls_lock);
+    FileCall& last = g_calls[(g_calls_next + kFileCalls - 1) % kFileCalls];
+    if (last.times && last.op == op && last.at == at && last.asked == asked && last.got == got &&
+        last.status == status && name.compare(0, sizeof(last.name) - 1, last.name) == 0) {
+        last.times++;
+        return;
+    }
+    FileCall& c = g_calls[g_calls_next++ % kFileCalls];
+    c.op = op;
+    std::snprintf(c.name, sizeof(c.name), "%s", name.c_str());
+    c.at = at, c.asked = asked, c.got = got, c.status = status, c.times = 1;
+}
 
 struct Link : Object {
     std::string target;
@@ -281,6 +312,7 @@ uint32_t OpenOnDisc(const Disc::Entry* e, const std::string& name, uint32_t hand
                     uint32_t options) {
     if (!e && (disposition == 1 || disposition == 4)) {  // FILE_OPEN or FILE_OVERWRITE need an existing file
         LOG_FIRST(200, "missing %s", name.c_str());
+        NoteCall('m', name, 0, 0, 0, kObjectNameNotFound);
         IoStatus(iosb, kObjectNameNotFound, 5);
         return kObjectNameNotFound;
     }
@@ -299,6 +331,7 @@ uint32_t OpenOnDisc(const Disc::Entry* e, const std::string& name, uint32_t hand
     W32(handle_out, NewHandle(f));
     IoStatus(iosb, kSuccess, 1);
     LOG_FIRST(400, "open %s", name.c_str());
+    NoteCall('o', name, 0, 0, 0, kSuccess);
     return kSuccess;
 }
 
@@ -373,6 +406,7 @@ KERNEL_EXPORT(190, NtCreateFile, 9) {
         case 1:  // open
             if (!exists) {
                 LOG_FIRST(200, "missing %s", name.c_str());
+                NoteCall('m', name, 0, 0, 0, kObjectNameNotFound);
                 IoStatus(iosb, kObjectNameNotFound, 5);
                 return kObjectNameNotFound;
             }
@@ -410,6 +444,7 @@ KERNEL_EXPORT(190, NtCreateFile, 9) {
     if (!fp && std::string(mode) == "r+b") fp = std::fopen(host.c_str(), "rb");  // read only media
     if (!fp) {
         LOGW("NtCreateFile: cannot open %s", host.c_str());
+        NoteCall('m', name, 0, 0, 0, kAccessDenied);
         IoStatus(iosb, kAccessDenied, 0);
         return kAccessDenied;
     }
@@ -421,6 +456,7 @@ KERNEL_EXPORT(190, NtCreateFile, 9) {
     W32(handle_out, NewHandle(f));
     IoStatus(iosb, kSuccess, info);
     LOG_FIRST(400, "open %s", name.c_str());
+    NoteCall('o', name, 0, 0, 0, kSuccess);
     return kSuccess;
 }
 
@@ -435,6 +471,7 @@ KERNEL_EXPORT(202, NtOpenFile, 6) {
     std::error_code ec;
     if (host.empty() || !fs::exists(host, ec)) {
         LOG_FIRST(200, "missing %s", name.c_str());
+        NoteCall('m', name, 0, 0, 0, kObjectNameNotFound);
         IoStatus(iosb, kObjectNameNotFound, 5);
         return host.empty() ? kObjectPathNotFound : kObjectNameNotFound;
     }
@@ -467,6 +504,20 @@ static uint64_t Offset(File& f, uint32_t off) {
     return o >= 0 ? uint64_t(o) : f.pos;
 }
 
+// a host file's bytes until n or the end: fread stops short when a read is interrupted (EINTR), which on FUSE storage
+// (Android's shared storage and cards) cut game files short while the title was told the read succeeded
+static size_t ReadHost(FILE* fp, void* to, size_t n) {
+    size_t done = 0;
+    while (done < n) {
+        size_t got = std::fread(static_cast<uint8_t*>(to) + done, 1, n - done, fp);
+        done += got;
+        if (got) continue;
+        if (!std::ferror(fp) || errno != EINTR) break;
+        std::clearerr(fp);
+    }
+    return done;
+}
+
 // pages is the FILE_SEGMENT_ELEMENT array for scatter and gather, 0 for one buffer
 static uint32_t Transfer(const Args& a, bool write, uint32_t pages) {
     uint32_t h = a[0], event = a[1], apc = a[2], apc_ctx = a[3], iosb = a[4], buf = a[5], len = a[6], off = a[7];
@@ -475,6 +526,7 @@ static uint32_t Transfer(const Args& a, bool write, uint32_t pages) {
     if (write && f->entry) return kAccessDenied;
     ResetEvent(*f);
     std::lock_guard<std::mutex> lock(f->io);
+    auto started = std::chrono::steady_clock::now();
     uint64_t pos = Offset(*f, off);
     if (f->fp) Seek(f->fp, pos);
     uint32_t n = 0;
@@ -483,11 +535,17 @@ static uint32_t Transfer(const Args& a, bool write, uint32_t pages) {
         uint32_t chunk = pages ? std::min(len - n, 0x1000 - n % 0x1000) : len;
         size_t done = f->entry ? MountedDisc()->Read(*f->entry, pos + n, HostPtr(at), chunk)
                       : write  ? std::fwrite(HostPtr(at), 1, chunk, f->fp)
-                               : std::fread(HostPtr(at), 1, chunk, f->fp);
+                               : ReadHost(f->fp, HostPtr(at), chunk);
         n += uint32_t(done);
         if (done < chunk) break;
     }
     f->pos = pos + n;
+    if (!write) {
+        NoteCall('r', f->xbox, pos, len, n, len && !n ? kEndOfFile : kSuccess);
+        g_read_ns.fetch_add(uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                         std::chrono::steady_clock::now() - started).count()),
+                            std::memory_order_relaxed);
+    }
     if (write && n < len) return Finish(*f, 0xC000007F, n, event, apc, apc_ctx, iosb);  // disk full
     if (!write && len && !n) return Finish(*f, kEndOfFile, 0, event, apc, apc_ctx, iosb);
     return Finish(*f, kSuccess, n, event, apc, apc_ctx, iosb);
@@ -678,6 +736,7 @@ KERNEL_EXPORT(210, NtQueryFullAttributesFile, 2) {
     std::error_code ec;
     if (t.disc ? !t.entry : t.host.empty() || !fs::exists(t.host, ec)) {
         LOG_FIRST(200, "missing %s", name.c_str());
+        NoteCall('m', name, 0, 0, 0, kObjectNameNotFound);
         return kObjectNameNotFound;
     }
     if (t.disc) FillNetworkInfo(a[1], *t.entry);
@@ -749,6 +808,21 @@ KERNEL_EXPORT(215, NtQuerySymbolicLinkObject, 3) {
     std::memcpy(HostPtr(R32(str + 4)), t.data(), t.size());
     W16(str, uint16_t(t.size()));
     return kSuccess;
+}
+
+uint64_t TakeReadNs() { return g_read_ns.exchange(0, std::memory_order_relaxed); }
+
+void LogRecentFiles() {
+    std::lock_guard lock(g_calls_lock);
+    for (uint32_t i = 0; i < kFileCalls; i++) {
+        const FileCall& c = g_calls[(g_calls_next + i) % kFileCalls];
+        if (!c.times) continue;
+        if (c.op == 'r')
+            LOGDIAG("files: read %s at %llu asked %u got %u status %08X x%u", c.name, (unsigned long long)c.at, c.asked,
+                 c.got, c.status, c.times);
+        else
+            LOGDIAG("files: %s %s status %08X x%u", c.op == 'o' ? "open" : "missing", c.name, c.status, c.times);
+    }
 }
 
 }  // namespace kernel

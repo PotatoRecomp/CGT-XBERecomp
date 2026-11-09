@@ -16,8 +16,12 @@ namespace {
 constexpr uint32_t kOutChannels = 2;
 constexpr uint32_t kFrames = kRate / 200;  // the mixer renders 5 ms at a time
 // the device period asked for: 256 frames, 5.3 ms. PipeWire's default of 1024 put about 50 ms between a sound
-// starting and the speakers, a gunshot heard late
+// starting and the speakers, a gunshot heard late. Not on Android: SDL hands it to AAudio as the callback size with
+// twice that as the whole buffer, 10.7 ms, which a slower phone's mixer (or a guest thread holding DirectSound's lock)
+// overran now and then, heard as pops and crackling. There SDL's own 20 ms is kept
+#ifndef __ANDROID__
 constexpr const char* kDeviceFrames = "256";
+#endif
 
 struct Output {
     SDL_AudioStream* stream = nullptr;
@@ -47,7 +51,9 @@ void StartOutput(std::function<void(float* out, uint32_t frames)> render) {
     g_out.render = std::move(render);
     // the audio device's threads mix on the host and run no guest code: started off the guest threads' one CPU
     kernel::HostThreadsFree free_threads;
+#ifndef __ANDROID__
     SDL_SetHint(SDL_HINT_AUDIO_DEVICE_SAMPLE_FRAMES, kDeviceFrames);
+#endif
     if (!SDL_InitSubSystem(SDL_INIT_AUDIO)) {
         LOGE("audio: SDL audio unavailable, no sound: %s", SDL_GetError());
         return;

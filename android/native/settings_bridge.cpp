@@ -26,7 +26,7 @@ namespace {
 enum Key : int {
     kResolution, kMsaa, kSmaa, kFxaa, kAniso, kBloom, kFog, kHdr, kHdrAvailable, kScreenFilter, kVsync, kFpsCap,
     kFrameRate60, kFpsCounter, kTouchSensitivity, kTouchInvertY, kControlsOpacity, kMouseLook, kMouseSensitivity,
-    kMouseInvertY, kVolume, kOutWidth, kOutHeight, kKeyCount
+    kMouseInvertY, kVolume, kOutWidth, kOutHeight, kFrameSkip, kAsyncShaders, kShadows, kKeyCount
 };
 
 // the names for the settings log, in Key order
@@ -34,6 +34,7 @@ const char* const kKeyNames[] = {
     "render_percent", "msaa", "smaa", "fxaa", "anisotropic_filtering", "bloom", "fog", "hdr_output", "hdr_available",
     "screen_filter", "vsync", "fps_cap", "frame_rate_60", "fps_counter", "touch_sensitivity", "touch_invert_y",
     "controls_opacity", "mouse_look", "mouse_sensitivity", "mouse_invert_y", "volume", "out_width", "out_height",
+    "frame_skip", "async_shaders", "shadows",
 };
 static_assert(sizeof(kKeyNames) / sizeof(kKeyNames[0]) == kKeyCount);
 
@@ -119,6 +120,9 @@ extern "C" JNIEXPORT jintArray JNICALL Java_com_datfooldive_cgt_CGTActivity_nati
     v[kVolume] = jint(o.volume);
     v[kOutWidth] = jint(out.width);
     v[kOutHeight] = jint(out.height);
+    v[kFrameSkip] = o.frame_skip;
+    v[kAsyncShaders] = o.async_shaders;
+    v[kShadows] = o.shadows;
     jintArray arr = env->NewIntArray(kKeyCount);
     if (arr) env->SetIntArrayRegion(arr, 0, kKeyCount, v);
     return arr;
@@ -137,6 +141,9 @@ extern "C" JNIEXPORT void JNICALL Java_com_datfooldive_cgt_CGTActivity_nativeSet
         case kAniso: s.aniso = OneOf(value, {0u, 2u, 4u, 8u, 16u}); break;
         case kBloom: o.bloom = value != 0; break;
         case kFog: o.fog = value != 0; break;
+        case kFrameSkip: o.frame_skip = value != 0; break;
+        case kAsyncShaders: o.async_shaders = value != 0; break;
+        case kShadows: o.shadows = value != 0; break;
         case kHdr: o.hdr_output = value != 0 && game::g_hdr_display.load(); break;
         case kScreenFilter: o.screen_filter = uint32_t(std::clamp<jint>(value, 0, game::kFilterHdr)); break;
         case kVsync: s.vsync = value != 0; break;

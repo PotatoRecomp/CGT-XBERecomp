@@ -90,8 +90,15 @@ set(IMGUI_SOURCES ${imgui_SOURCE_DIR}/imgui.cpp ${imgui_SOURCE_DIR}/imgui_draw.c
 set_source_files_properties(${imgui_SOURCE_DIR}/backends/imgui_impl_vulkan.cpp PROPERTIES
     COMPILE_DEFINITIONS IMGUI_IMPL_VULKAN_NO_PROTOTYPES)
 
+# kBuildId, cgt.log's header: rewritten at every build (android/build_id.cmake), compiled again only when it changes
+set(BUILD_ID_CPP ${CMAKE_CURRENT_BINARY_DIR}/build_id.cpp)
+add_custom_target(build_id
+    COMMAND ${CMAKE_COMMAND} -DREPO=${REPO} -DOUT=${BUILD_ID_CPP} -P ${CMAKE_CURRENT_SOURCE_DIR}/build_id.cmake
+    BYPRODUCTS ${BUILD_ID_CPP})
+
 add_library(main SHARED ${RUNTIME_SOURCES} ${GAME_HOST_SOURCES} ${ANDROID_SOURCES} ${GEN_SOURCES} ${IMGUI_SOURCES}
-            ${CMAKE_CURRENT_BINARY_DIR}/image_sha1.cpp)
+            ${CMAKE_CURRENT_BINARY_DIR}/image_sha1.cpp ${BUILD_ID_CPP})
+add_dependencies(main build_id)
 target_include_directories(main PRIVATE ${NATIVE}/compat ${SDK}/harness/compat ${NATIVE} ${GAME} ${SDK}/runtime ${GEN}
                            ${CMAKE_CURRENT_BINARY_DIR} ${glslang_SOURCE_DIR})
 target_include_directories(main SYSTEM PRIVATE ${imgui_SOURCE_DIR} ${vma_SOURCE_DIR}/include)
@@ -107,3 +114,8 @@ target_link_libraries(main PRIVATE SDL3::SDL3 tomlplusplus::tomlplusplus glslang
                       vulkan android log)
 # 16 KB pages, as Android 15 devices may have
 target_link_options(main PRIVATE -Wl,-z,max-page-size=16384)
+# the library's own functions bound to themselves at link: as a shared library of default visibility each of the
+# recompiled code's calls to another of its functions (25 thousand of them) went through a PLT stub and a GOT load,
+# about a tenth of the game thread's time on a Helio G99. A hook's strong definition still wins over the weak one
+# here, at link; nothing looks the game's functions up at run time
+target_link_options(main PRIVATE -Wl,-Bsymbolic-functions)

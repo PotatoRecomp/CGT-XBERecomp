@@ -1,5 +1,6 @@
 #pragma once
 #include <filesystem>
+#include <string>
 
 #include "core/input.h"
 
@@ -26,6 +27,11 @@ void ControlsSync(bool pad);
 // the settings panel (SettingsDialog.java) opened or closed from native: F10, or Escape while it is open, on a
 // keyboard (src/common/keyboard.cpp through app::ToggleMenu); any thread
 void ShowSettings(bool show);
+// the GPU the renderer picked, for the stats overlay; set once at its start
+void SetGpuName(const char* name);
+const char* GpuName();
+// the SoC as Android names it (ro.soc.model, the board platform, /proc/cpuinfo), empty when none says
+const std::string& SocName();
 
 // app::kGame's hooks on Android (src/common/game_info.cpp): each frame's ImGui drawing (the FPS counter, the overlay
 // told of a controller), the pad with the on-screen controls laid over it, and the touch layout kept in the settings
@@ -56,5 +62,7 @@ void ResetUnits();  // the pad's own layout back, every control at its kind's si
 // gameplay: the stick and buttons of the on-screen controls, over the pad the keyboard left
 void Apply(input::Pad& pad);
 void Frame();  // once a frame: tells the overlay when a controller comes or goes
+// the stats overlay's lines as one, for a report (native/main.cpp)
+void StatsLine(char* out, size_t size);
 
 }  // namespace touch

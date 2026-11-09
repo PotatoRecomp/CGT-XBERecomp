@@ -8,6 +8,7 @@
 
 #include "app/app.h"
 #include "core/log.h"
+#include "host.h"
 #include "image_symbols.h"
 
 namespace app {
@@ -20,14 +21,14 @@ std::string Prop(const char* name) {
     return n > 0 ? std::string(value, size_t(n)) : std::string();
 }
 
+}  // namespace
+
 std::string CpuName() {
     std::ifstream f("/proc/cpuinfo");
     for (std::string line; std::getline(f, line);)
         if (line.compare(0, 9, "Hardware:") == 0 || line.compare(0, 10, "model name") == 0) return line.substr(line.find(':') + 2);
     return Prop("ro.soc.model");
 }
-
-}  // namespace
 
 void LogSystem() {
     std::time_t now = std::time(nullptr);
@@ -48,3 +49,18 @@ void LogSystem() {
 }
 
 }  // namespace app
+
+namespace host {
+
+const std::string& SocName() {
+    static const std::string name = [] {
+        for (const char* p : {"ro.soc.model", "ro.board.platform", "ro.hardware"}) {
+            char value[PROP_VALUE_MAX] = {};
+            if (__system_property_get(p, value) > 0) return std::string(value);
+        }
+        return app::CpuName();
+    }();
+    return name;
+}
+
+}  // namespace host

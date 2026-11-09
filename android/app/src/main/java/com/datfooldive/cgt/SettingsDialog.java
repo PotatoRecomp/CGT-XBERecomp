@@ -12,6 +12,7 @@ import android.view.WindowManager;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
 import android.widget.TextView;
+import android.widget.Toast;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -28,9 +29,9 @@ class SettingsDialog extends Dialog {
     static final int RESOLUTION = 0, MSAA = 1, SMAA = 2, FXAA = 3, ANISO = 4, BLOOM = 5, FOG = 6, HDR = 7,
             HDR_AVAILABLE = 8, SCREEN_FILTER = 9, VSYNC = 10, FPS_CAP = 11, FRAME_RATE_60 = 12, FPS_COUNTER = 13,
             TOUCH_SENSITIVITY = 14, TOUCH_INVERT_Y = 15, OPACITY = 16, MOUSE_LOOK = 17, MOUSE_SENSITIVITY = 18,
-            MOUSE_INVERT_Y = 19, VOLUME = 20, OUT_W = 21, OUT_H = 22, COUNT = 23;
+            MOUSE_INVERT_Y = 19, VOLUME = 20, OUT_W = 21, OUT_H = 22, FRAME_SKIP = 23, ASYNC_SHADERS = 24, SHADOWS = 25, COUNT = 26;
 
-    private static final int BG = Theme.BG, TEXT = Theme.TEXT, DIM = Theme.DIM, FRAME = Theme.FRAME,
+    private static final int BG = Theme.BG, TEXT = Theme.TEXT, FRAME = Theme.FRAME,
             BUTTON = Theme.BUTTON, BUTTON_ON = Theme.BUTTON_ON, SELECTED = Theme.SELECTED;
 
     private final CGTActivity activity;  // the dialog's own context is a wrapper around it, not it
@@ -147,46 +148,37 @@ class SettingsDialog extends Dialog {
 
     private void display(LinearLayout box) {
         slider(box, "RENDER RESOLUTION", RESOLUTION, 25, 200, 5, value -> String.format(Locale.US, "%d%% (%dx%d)",
-                value, v[OUT_W] * value / 100, v[OUT_H] * value / 100),
-                "Of the screen's height: below 100 is faster and cooler, above sharper.");
-        toggle(box, "VERTICAL SYNC", VSYNC, null);
-        stepper(box, "MAX FRAME RATE", MAX_FPS_NAMES, MAX_FPS, FPS_CAP, "The console ran the game at 30.");
-        stepper(box, "GAME FRAME RATE", new String[] {"30 (CONSOLE)", "60"}, new int[] {0, 1}, FRAME_RATE_60,
-                "The game paces itself at 30 like the console; 60 runs it twice as smooth at the same speed.");
-        toggle(box, "FPS COUNTER", FPS_COUNTER, null);
-        // the row and its hint together, shown only where the screen has HDR
-        LinearLayout hdr = new LinearLayout(getContext());
-        hdr.setOrientation(LinearLayout.VERTICAL);
-        box.addView(hdr);
-        toggle(hdr, "HDR OUTPUT", HDR, "HDR10 on a screen with HDR turned on.");
-        hdrRow = hdr;
+                value, v[OUT_W] * value / 100, v[OUT_H] * value / 100));
+        toggle(box, "VERTICAL SYNC", VSYNC);
+        stepper(box, "MAX FRAME RATE", MAX_FPS_NAMES, MAX_FPS, FPS_CAP);
+        stepper(box, "GAME FRAME RATE", new String[] {"30 (CONSOLE)", "60"}, new int[] {0, 1}, FRAME_RATE_60);
+        toggle(box, "FRAME SKIP", FRAME_SKIP);
+        toggle(box, "FPS COUNTER", FPS_COUNTER);
+        hdrRow = toggle(box, "HDR OUTPUT", HDR);  // shown only where the screen has HDR
     }
 
     private static final String[] MAX_FPS_NAMES = {"30", "60", "90", "120", "UNLIMITED"};
     private static final int[] MAX_FPS = {30, 60, 90, 120, 0};
 
     private void graphics(LinearLayout box) {
-        stepper(box, "MSAA", new String[] {"OFF", "2X", "4X", "8X"}, new int[] {0, 2, 4, 8}, MSAA,
-                "Multisampling: smooth geometry edges, sharp image.");
-        toggle(box, "SMAA", SMAA, "Smooths every edge of the frame, alpha tested ones too.");
-        toggle(box, "FXAA", FXAA, "A cheap edge blur at the present.");
+        stepper(box, "MSAA", new String[] {"OFF", "2X", "4X", "8X"}, new int[] {0, 2, 4, 8}, MSAA);
+        toggle(box, "SMAA", SMAA);
+        toggle(box, "FXAA", FXAA);
         stepper(box, "ANISOTROPIC FILTERING", new String[] {"GAME DEFAULT", "2X", "4X", "8X", "16X"},
-                new int[] {0, 2, 4, 8, 16}, ANISO, null);
-        toggle(box, "BLOOM", BLOOM, null);
-        toggle(box, "FOG", FOG, null);
+                new int[] {0, 2, 4, 8, 16}, ANISO);
+        toggle(box, "BLOOM", BLOOM);
+        toggle(box, "FOG", FOG);
+        toggle(box, "SHADOWS", SHADOWS);
+        toggle(box, "ASYNC SHADERS", ASYNC_SHADERS);
         stepper(box, "SCREEN FILTER", new String[] {"OFF", "SHARPEN", "VIVID", "SCANLINES", "CRT", "HDR LOOK"},
-                new int[] {0, 1, 2, 3, 4, 5}, SCREEN_FILTER,
-                "SHARPEN crisper edges, VIVID richer colour, SCANLINES and CRT a TV's look, HDR LOOK deeper shadows "
-                        + "and held back highlights.");
+                new int[] {0, 1, 2, 3, 4, 5}, SCREEN_FILTER);
     }
 
     private void controls(LinearLayout box) {
         heading(box, "TOUCH");
-        slider(box, "LOOK SENSITIVITY", TOUCH_SENSITIVITY, 10, 300, 5, SettingsDialog::scale,
-                "A swipe on the right of the screen, or a thumb held on FIRE and dragged, turns the view directly as a "
-                        + "mouse does. 1.00 turns 0.25 degrees a dp; scopes and zoom scale it down with the view.");
-        toggle(box, "LOOK INVERT Y", TOUCH_INVERT_Y, null);
-        slider(box, "BUTTON OPACITY", OPACITY, 0, 100, 5, value -> value + "%", null);
+        slider(box, "LOOK SENSITIVITY", TOUCH_SENSITIVITY, 10, 300, 5, SettingsDialog::scale);
+        toggle(box, "LOOK INVERT Y", TOUCH_INVERT_Y);
+        slider(box, "BUTTON OPACITY", OPACITY, 0, 100, 5, value -> value + "%");
         TextView edit = chip("MOVE CONTROLS", 13);
         edit.setPadding(0, dp(7), 0, dp(7));
         edit.setOnClickListener(x -> {
@@ -200,15 +192,13 @@ class SettingsDialog extends Dialog {
         box.addView(edit, lp);
 
         heading(box, "MOUSE");
-        toggle(box, "MOUSE LOOK", MOUSE_LOOK, "A mouse plugged into the phone turns the view directly.");
-        slider(box, "MOUSE SENSITIVITY", MOUSE_SENSITIVITY, 5, 500, 5, SettingsDialog::scale,
-                "1.00 turns 0.022 degrees a count, as most PC shooters.");
-        toggle(box, "MOUSE INVERT Y", MOUSE_INVERT_Y, null);
+        toggle(box, "MOUSE LOOK", MOUSE_LOOK);
+        slider(box, "MOUSE SENSITIVITY", MOUSE_SENSITIVITY, 5, 500, 5, SettingsDialog::scale);
+        toggle(box, "MOUSE INVERT Y", MOUSE_INVERT_Y);
     }
 
     private void audio(LinearLayout box) {
-        slider(box, "VOLUME", VOLUME, 50, 400, 25, value -> value + "%",
-                "The game mixes quietly for a TV: 200% matches the phone's other sound.");
+        slider(box, "VOLUME", VOLUME, 50, 400, 25, value -> value + "%");
     }
 
     // a percentage of a sensitivity as the desktop panel writes it, 1.00 for 100
@@ -232,14 +222,6 @@ class SettingsDialog extends Dialog {
         return row;
     }
 
-    // the desktop panel's tooltip, under its row
-    private void hint(LinearLayout box, String hint) {
-        if (hint == null) return;
-        TextView t = text(hint, 11, DIM);
-        t.setPadding(0, 0, dp(8), dp(4));
-        box.addView(t);
-    }
-
     private void heading(LinearLayout box, String title) {
         TextView t = text(title, 12, Theme.HEADING);
         t.setPadding(0, dp(8), 0, dp(2));
@@ -247,8 +229,7 @@ class SettingsDialog extends Dialog {
     }
 
     // a value dragged along a bar; the arrows of a focused one step it
-    private void slider(LinearLayout box, String label, int key, int min, int max, int step, Format format,
-                        String hint) {
+    private void slider(LinearLayout box, String label, int key, int min, int max, int step, Format format) {
         LinearLayout row = row(box, label);
         Theme.Slider bar = new Theme.Slider(getContext(), (max - min) / step);
         Runnable show = () -> bar.setText(format.of(min + bar.progress * step));
@@ -276,7 +257,6 @@ class SettingsDialog extends Dialog {
             bar.listener.released(bar.progress);
         });
         row.addView(bar, new LinearLayout.LayoutParams(0, dp(28), 1.1f));
-        hint(box, hint);
         refreshers.add(() -> {
             bar.setProgress((Math.max(min, Math.min(v[key], max)) - min) / step);
             show.run();
@@ -284,7 +264,7 @@ class SettingsDialog extends Dialog {
     }
 
     // a value from a list, < value > as on the desktop panel
-    private void stepper(LinearLayout box, String label, String[] names, int[] values, int key, String hint) {
+    private void stepper(LinearLayout box, String label, String[] names, int[] values, int key) {
         LinearLayout row = row(box, label);
         LinearLayout control = new LinearLayout(getContext());
         control.setOrientation(LinearLayout.HORIZONTAL);
@@ -314,12 +294,11 @@ class SettingsDialog extends Dialog {
         control.addView(value, middle);
         control.addView(up, new LinearLayout.LayoutParams(arrow));
         row.addView(control, new LinearLayout.LayoutParams(0, dp(28), 1.1f));
-        hint(box, hint);
         refreshers.add(() -> value.setText(names[indexOf(values, v[key])]));
     }
 
-    // ON or OFF, a tap or either arrow flips it; the row is returned so it can be dimmed
-    private View toggle(LinearLayout box, String label, int key, String hint) {
+    // ON or OFF, a tap or either arrow flips it; the row is returned so it can be hidden
+    private View toggle(LinearLayout box, String label, int key) {
         LinearLayout row = row(box, label);
         TextView sw = text("", 13, TEXT);
         sw.setGravity(Gravity.CENTER);
@@ -335,7 +314,6 @@ class SettingsDialog extends Dialog {
         sw.setOnClickListener(x -> flip.by(1));
         focusable(sw, flip);
         row.addView(sw, new LinearLayout.LayoutParams(0, dp(28), 1.1f));
-        hint(box, hint);
         refreshers.add(() -> paint(sw, v[key] != 0));
         return row;
     }
@@ -404,10 +382,20 @@ class SettingsDialog extends Dialog {
     private LinearLayout footer() {
         LinearLayout row = new LinearLayout(getContext());
         row.setOrientation(LinearLayout.HORIZONTAL);
-        row.setGravity(Gravity.CENTER_VERTICAL);
+        row.setGravity(Gravity.CENTER_VERTICAL | Gravity.END);
         row.setPadding(0, dp(6), 0, 0);
-        row.addView(text("Saved as you change them. F10 / BACK close", 11, DIM),
-                new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+
+        // the stats, each thread's stack and the last file reads into cgt.log, for a hang or a drop to be sent in
+        TextView report = chip("SAVE REPORT", 13);
+        report.setOnClickListener(x -> {
+            String path = CGTActivity.nativeSaveReport();
+            Toast.makeText(activity, path == null || path.isEmpty() ? "Report not saved" : "Report saved to " + path,
+                    Toast.LENGTH_LONG).show();
+        });
+        LinearLayout.LayoutParams first = new LinearLayout.LayoutParams(dp(128), dp(30));
+        row.addView(report, first);
+        View space = new View(getContext());
+        row.addView(space, new LinearLayout.LayoutParams(0, 1, 1f));
 
         TextView defaults = chip("DEFAULTS", 13);
         defaults.setOnClickListener(x -> {

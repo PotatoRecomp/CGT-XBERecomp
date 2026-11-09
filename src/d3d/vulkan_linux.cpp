@@ -121,6 +121,57 @@ bool CaptureOn() {
     return !diag::CaptureDir().empty();
 }
 
+// Cracks: a slit under one console pixel wide between two surfaces, through which a pixel sees something much
+// farther than both. The game's art has such slits: in the first mission a door's edge face and its frame's
+// jamb leave one, and through it the next room shows fully fogged, the tan fog colour, as a line wherever a pixel
+// centre falls in it; drawn larger than the console's 640x480 it shows on nearly every row. Such a pixel takes the
+// colour of the surfaces either side; every other pixel is left as it was.
+// opt: x most host pixels a crack spans. A perspective depth's 1 - d goes as 1 / distance, so a side a fifth nearer
+// has a 1 - d a fifth larger, with no projection needed. The two sides need not match: the slit is there whatever is
+// in front of one side (the player standing by a door)
+const char* kCrackHlsl = R"(
+cbuffer P : register(b1) { float4 opt; float4 opt2; };
+Texture2D<float4> img : register(t0);
+Texture2D<float> depth : register(t1);
+struct O { float4 p : SV_Position; float2 uv : TEXCOORD0; };
+O vs(uint id : SV_VertexID) {
+    O o;
+    o.uv = float2((id << 1) & 2, id & 2);
+    o.p = float4(o.uv * float2(2, -2) + float2(-1, 1), 0, 1);
+    return o;
+}
+float4 fill(O i) : SV_Target {
+    int2 p = int2(i.p.xy);
+    uint w, h;
+    img.GetDimensions(w, h);
+    float4 c = img.Load(int3(p, 0));
+    // 1 - depth goes as 1 / distance: a side is nearer than this pixel by a fifth or more
+    float ic = 1 - depth.Load(int3(p, 0));
+    float nearer = ic * 1.2 + 1e-6;
+    int n = int(opt.x);
+    [unroll] for (int axis = 0; axis < 2; axis++) {
+        int2 step = axis == 0 ? int2(1, 0) : int2(0, 1);
+        int lo = 0, hi = 0;
+        [loop] for (int k = 1; k <= n; k++) {
+            int2 q = p - step * k;
+            if (q.x < 0 || q.y < 0) break;
+            float d = depth.Load(int3(q, 0));
+            if (1 - d > nearer) { lo = k; break; }
+        }
+        [loop] for (int k = 1; k <= n; k++) {
+            int2 q = p + step * k;
+            if (q.x >= int(w) || q.y >= int(h)) break;
+            float d = depth.Load(int3(q, 0));
+            if (1 - d > nearer) { hi = k; break; }
+        }
+        if (lo == 0 || hi == 0 || lo + hi - 1 > n) continue;
+        float4 a = img.Load(int3(p - step * lo, 0)), b = img.Load(int3(p + step * hi, 0));
+        return lerp(a, b, float(lo) / float(lo + hi));
+    }
+    return c;
+}
+)";
+
 const char* kBlitHlsl = R"(
 cbuffer B : register(b1) { float4 uvrect; float4 opts; };
 Texture2D img : register(t0);
@@ -752,17 +803,22 @@ constexpr uint32_t kSigWholeMax = 65536;
 constexpr uint32_t kSigSamples = 64;
 constexpr uint32_t kSigSampleBytes = 64;
 
-uint64_t MemSig(uint32_t data, uint32_t total) {
+// MemSig's hash alone: DeliverLate runs on the title's thread, and g_perf is the render thread's
+uint64_t GuestSig(uint32_t data, uint32_t total) {
     const uint8_t* p = static_cast<const uint8_t*>(kernel::HostPtr(data));
     uint64_t sig = Hash(&total, sizeof(total));
-    g_perf.sigs++;
-    g_perf.sig_bytes += total <= kSigWholeMax ? total : kSigSamples * kSigSampleBytes;
     if (total <= kSigWholeMax) return Hash(p, total, sig);
     for (uint32_t i = 0; i < kSigSamples; i++) {
         const uint8_t* sample = p + uint64_t(total - kSigSampleBytes) * i / (kSigSamples - 1);
         sig = Hash(sample, kSigSampleBytes, sig);
     }
     return sig;
+}
+
+uint64_t MemSig(uint32_t data, uint32_t total) {
+    g_perf.sigs++;
+    g_perf.sig_bytes += total <= kSigWholeMax ? total : kSigSamples * kSigSampleBytes;
+    return GuestSig(data, total);
 }
 
 // MemSig samples a big surface and misses small writes (XFONT text): after a Sync every byte is compared
@@ -1029,6 +1085,8 @@ private:
     VkPipeline CreatePassPipeline(const PassPipe& p);
     bool BindTargets(const State& s);
     bool DepthCopy(const State& s);
+    bool SkipShadow(const State& s);
+    void EndShadowFrame();
     bool DepthPass(Image* src, Image* dst, uint32_t w, uint32_t h);
     VkPipeline EnsureDepthCopyPipeline(bool ms, uint32_t samples);
     // one full screen pass of kAoHlsl
@@ -1112,6 +1170,7 @@ private:
     void UploadGammaRamp();
     void DrawFrame(Target* t, uint32_t bi);
     Image* PrepareShownFrame(Target* t);
+    void FillCracks(const State& s);
     Image* Smaa(Image* src, VkFormat fmt, uint32_t w, uint32_t h);
     struct SmaaLookup {
         VkFormat fmt;
@@ -1177,6 +1236,7 @@ private:
     // RecordLate's steps, under late_lock_
     struct Late;
     void ResetLate(Late& l, const Target& t);
+    bool CpuWrote(Target& t);
     Image* PrepareLateSource(Target& t, Late& l);
     void RecordLateCopy(Late& l, uint32_t slot, Image* src);
 
@@ -1254,6 +1314,17 @@ private:
     uint32_t bb_w_ = 0;
     uint32_t bb_h_ = 0;
     float scale_ = 1.0f;
+    std::unordered_set<uint64_t> shadow_maps_;  // targets_ keys of the game's shadow maps (SkipShadow)
+    uint32_t shadow_light_ = 0;   // this frame's lights whose shadows began so far
+    bool in_shadow_map_ = false;  // the last draw or clear went to a shadow map
+    // for FillCracks, by colour surface (physical): the depth surface its depth writing draws used and their frame
+    struct SceneDepth {
+        Surface zs;
+        uint64_t frame;
+    };
+    std::unordered_map<uint32_t, SceneDepth> scene_depth_;
+    ImageRef crack_;              // the scene's target copied aside for FillCracks
+    uint64_t crack_frame_ = UINT64_MAX;  // the frame FillCracks last ran in
     uint32_t msaa_ = 1;      // samples in use
     uint32_t msaa_set_ = 0;  // the setting they came from
     // ambient occlusion: the raw pass and its first blur, each with view z beside it
@@ -1268,6 +1339,8 @@ private:
         uint64_t fence[kFrames] = {};
         uint64_t frame[kFrames] = {};
         uint64_t delivered = 0;
+        uint64_t delivered_sig = 0;  // GuestSig of the copy DeliverLate last wrote to guest memory, 0 for none
+        uint32_t bytes = 0;          // the target's guest bytes, what GuestSig hashes
         uint32_t gw = 0;
         uint32_t gh = 0;
         uint32_t next = 0;
@@ -2114,7 +2187,7 @@ bool VulkanBackend::BindTargets(const State& s) {
     if (rt && ds && (rt->w != ds->w || rt->h != ds->h || Ms(*rt) != Ms(*ds))) ds = nullptr;
     if (!rt && !ds) return false;
     if (rt) {
-        if (LatchCpuWrite(*rt)) UploadTarget(*rt, s.rt);
+        if (CpuWrote(*rt)) UploadTarget(*rt, s.rt);
         rt->drawn = true;
     }
     if (ds) ds->drawn = true;
@@ -2737,7 +2810,7 @@ Image* VulkanBackend::BindTargetTexture(const State& s, int stage, const Texture
     stages.rt[stage] = true;
     stages.gw[stage] = t.depth ? 0 : t.gw;
     info.flags |= kTexTarget;
-    if (!t.depth && LatchCpuWrite(t)) {
+    if (!t.depth && CpuWrote(t)) {
         Surface su;
         su.header = s.textures[size_t(stage)];
         UploadTarget(t, su);
@@ -3424,6 +3497,9 @@ void VulkanBackend::CaptureTextures(const State& s, const DrawTextures& stages) 
         fprintf(cap_, " | t%d %08X fmt %X %ux%u%s%s", i, d.data, d.format, d.width, d.height, tg ? " target" : "",
                 res ? "" : " unbound");
         if (uint32_t op = s.tss[size_t(i)][kTssColorKeyOp]) fprintf(cap_, " colorkey %u %08X", op, s.tss[size_t(i)][kTssColorKeyColor]);
+        const auto& ts = s.tss[size_t(i)];
+        fprintf(cap_, " addr %u,%u filt %u/%u/%u aniso %u", ts[kTssAddressU], ts[kTssAddressV], ts[kTssMagFilter],
+                ts[kTssMinFilter], ts[kTssMipFilter], ts[kTssMaxAnisotropy]);
         // any colour format: CapSave samples it; P8 entries are keyed by palette too, so match the image itself
         if (res && !tg && stages.info[i].kind == kTex2D && !Format(d.format).depth && cap_seen_.insert(d.data).second) {
             for (auto& [key, tx] : textures_)
@@ -3468,12 +3544,74 @@ void VulkanBackend::CaptureDraw(const State& s, uint32_t prim, uint32_t count, c
             cap_i_++, s.rt.data, bound_ds_ ? s.zs.data : 0, prim, count, s.vs_handle, s.ps ? s.ps->handle : 0, k.blend,
             k.src, k.dst, k.zen, k.zfunc, k.zwrite, k.zbias, k.zslope, k.cull, k.wmask, c.pc[0][0], c.pc[0][1],
             c.pc[0][2], c.pc[0][3]);
+    // the alpha test as the shader runs it: function (Cmp - 1, 8 always) against the reference
+    fprintf(cap_, " atest %.0f ref %.0f", c.misc[1], c.misc[0]);
     CaptureTextures(s, stages);
 }
 
-// small draws: their inputs and constants; then ends the draw's line
+// small draws: their inputs and constants; then ends the draw's line. Every draw: its raw positions (register 0,
+// float3 or float4) and the fixed-function transforms, enough to place its edges on screen offline
 void VulkanBackend::EndDrawCapture(const State& s, const Assembled& a, uint32_t count, const DrawConstants& c) {
     if (count <= kQuadVertices) CaptureInputs(s, a, c);
+    const VertexElement& e = a.elements[0];
+    if ((a.regs & 1) && (e.format == DXGI_FORMAT_R32G32B32_FLOAT || e.format == DXGI_FORMAT_R32G32B32A32_FLOAT) &&
+        a.vertices.empty()) {
+        const VertexBuffer& vb = a.buffers[e.buffer];
+        uint32_t n = std::min<uint32_t>(a.vertex_count, 512);
+        if (vb.src && vb.stride && uint64_t(n) * vb.stride <= vb.bytes) {
+            fprintf(cap_, "\n     pos %u", a.vertex_count);
+            for (uint32_t v = 0; v < n; v++) {
+                float p[3];
+                std::memcpy(p, vb.src + size_t(v) * vb.stride + e.offset, sizeof(p));
+                fprintf(cap_, " %.5g,%.5g,%.5g", p[0], p[1], p[2]);
+            }
+        }
+    }
+    // register 2's packed normal (NORMPACKED3, 11:11:10 signed, as UnpackNp3 reads it) and register 9's float2 uv
+    auto reg_dump = [&](int r, const char* tag, bool packed) {
+        const VertexElement& el = a.elements[size_t(r)];
+        if (!(a.regs >> r & 1) || !a.vertices.empty()) return;
+        const VertexBuffer& b = a.buffers[el.buffer];
+        uint32_t n = std::min<uint32_t>(a.vertex_count, 512);
+        if (!b.src || !b.stride || uint64_t(n) * b.stride > b.bytes) return;
+        fprintf(cap_, "\n     %s", tag);
+        for (uint32_t v = 0; v < n; v++) {
+            const uint8_t* at = b.src + size_t(v) * b.stride + el.offset;
+            if (packed) {
+                uint32_t u;
+                std::memcpy(&u, at, 4);
+                int x = int32_t(u << 21) >> 21, y = int32_t(u << 10) >> 21, z = int32_t(u) >> 22;
+                fprintf(cap_, " %.3f,%.3f,%.3f", std::max(x / 1023.0f, -1.0f), std::max(y / 1023.0f, -1.0f),
+                        std::max(z / 511.0f, -1.0f));
+            } else {
+                float f[2];
+                std::memcpy(f, at, sizeof(f));
+                fprintf(cap_, " %.4g,%.4g", f[0], f[1]);
+            }
+        }
+    };
+    if (a.elements[2].format == DXGI_FORMAT_R32_UINT) reg_dump(2, "nrm", true);
+    if (a.elements[9].format == DXGI_FORMAT_R32G32_FLOAT) reg_dump(9, "uv", false);
+    // the lights (D3DLIGHT8 as floats after the type), the material and the ambient
+    for (int i = 0; i < 8; i++) {
+        const auto& l = s.lights[size_t(i)];
+        if (!l[0]) continue;
+        fprintf(cap_, "\n     light%d type %u", i, l[0]);
+        for (int k = 1; k < 26; k++) {
+            float f;
+            std::memcpy(&f, &l[size_t(k)], 4);
+            fprintf(cap_, " %.4g", f);
+        }
+    }
+    fprintf(cap_, "\n     material");
+    for (float f : s.material) fprintf(cap_, " %.4g", f);
+    fprintf(cap_, "\n     ambient %08X lighting %u", s.rs[kRsAmbient], s.rs[kRsLighting]);
+    for (int m : {256, 2, 3}) {
+        fprintf(cap_, "\n     m%d", m);
+        for (float f : s.transforms[size_t(m)]) fprintf(cap_, " %.7g", f);
+    }
+    fprintf(cap_, "\n     vp %u %u %u %u %.3f %.3f", s.viewport.x, s.viewport.y, s.viewport.w, s.viewport.h,
+            s.viewport.min_z, s.viewport.max_z);
     fputc('\n', cap_);
 }
 
@@ -3591,9 +3729,14 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
         if (cap_) fprintf(cap_, "---- skip rt %08X prim %u count %u vs %08X: %s\n", s.rt.data, prim, count, s.vs_handle, why);
     };
     if (DepthCopy(s)) return skip("depth copy");
+    if (SkipShadow(s)) return skip("shadow light left out");
     Assembled& a = asm_;
     if (!AssembleDraw(s, prim, start, count, indices, a)) return skip("vertices not assembled");
     if (!BindTargets(s)) return skip("targets not bound");
+    // a depth tested, depth writing draw into a colour surface: the scene's own geometry (FillCracks)
+    if (s.rt.header && s.zs.header && s.rs[kRsZEnable] && SimpleState(s, kMZWriteEnable)) {
+        scene_depth_[s.rt.data] = {s.zs, presents_};
+    }
 
     // vertex shader
     DrawShaders sh = ClassifyShaders(s, a);
@@ -3683,7 +3826,7 @@ void VulkanBackend::ClearTarget(Target& t, const State& s, const ClearArgs& c, s
         SetAttachments(nullptr, t.res.get());
     } else {
         // pixels the CPU wrote before this clear go in first, a later upload would paint over the clear
-        if (LatchCpuWrite(t)) UploadTarget(t, s.rt);
+        if (CpuWrote(t)) UploadTarget(t, s.rt);
         ca.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
         float col[4];
         Color(c.color, col);
@@ -3709,7 +3852,9 @@ void VulkanBackend::Clear(const State& s, uint32_t count, const uint8_t* rects, 
         Occlusion(s, p);
         return;
     }
+    if (s.zs.header && (!s.rt.header || !s.rt.data) && SkipShadow(s)) return;  // a left out light's map
     PerfScope perf_clear{g_perf.clear};
+    if (flags & kClearZ) FillCracks(s);  // the scene's depth, before it goes
     if (cap_) {
         CapStep(s.rt);
         fprintf(cap_, "%04u clear rt %08X ds %08X flags %X color %08X z %.3f\n", cap_i_++, s.rt.data, s.zs.data, flags,
@@ -4115,6 +4260,41 @@ Image* VulkanBackend::PrepareShownFrame(Target* t) {
     return r;
 }
 
+// Cracks, filled in the scene's own target just before its depth is cleared (this game clears depth after the scene,
+// before its HUD, so at the present the depth that tells a slit is gone): the target copied aside, then kCrackHlsl
+// reads the copy and the depth and writes every pixel back, a slit's from the surfaces either side. Once a frame, for
+// a target the frame's depth writing draws went to with this depth surface, single sampled
+void VulkanBackend::FillCracks(const State& s) {
+    if (!s.rt.header || !s.zs.header || crack_frame_ == presents_) return;
+    auto it = scene_depth_.find(s.rt.data);
+    if (it == scene_depth_.end() || it->second.frame != presents_ || it->second.zs.data != s.zs.data) return;
+    Target* t = FindTarget(s.rt, false);
+    Target* ds = FindTarget(s.zs, true);
+    if (!t || !ds || ds->w != t->w || ds->h != t->h || Ms(*ds) > 1 || Ms(*t) > 1 || !ds->res->view) return;
+    crack_frame_ = presents_;
+    VkFormat fmt = t->res->format;
+    if (!crack_ || crack_->w != t->w || crack_->h != t->h || crack_->format != fmt) {
+        Release(std::move(crack_));
+        crack_ = CreateImage(fmt, t->w, t->h, VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT);
+        if (!crack_) return;
+    }
+    EndRendering();  // a copy is never inside a pass
+    Transition(*t->res, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    Transition(*crack_, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    VkImageSubresourceLayers layer{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    VkImageCopy c{layer, {0, 0, 0}, layer, {0, 0, 0}, {t->w, t->h, 1}};
+    vkCmdCopyImage(cl_, t->res->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, crack_->image,
+                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &c);
+    Transition(*crack_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    Transition(*ds->res, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    Image* const src[3] = {crack_.get(), ds->res.get(), nullptr};
+    // one console pixel across, in host pixels (one at the console's own size)
+    float p[8] = {std::max(1.0f, std::ceil(scale_)), 0, 0, 0, 0, 0, 0, 0};
+    if (Pass(kCrackHlsl, "vs", "fill", fmt, t->res.get(), t->w, t->h, src, p, -1)) t->drawn = true;
+    // a depth target left readable would pass for one whose single sample copy is current
+    Transition(*ds->res, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
+}
+
 // src readable: SMAA's blend of it, null when it can't run
 Image* VulkanBackend::Smaa(Image* src, VkFormat fmt, uint32_t w, uint32_t h) {
     static const std::string hlsl = std::string(kSmaaConfig) + kSmaaHlsl + kSmaaPasses;
@@ -4455,6 +4635,7 @@ void VulkanBackend::SubmitPresent(bool acquired, uint32_t bi) {
 
 void VulkanBackend::Present(const Surface& front) {
     PerfScope perf_present{g_perf.present};
+    EndShadowFrame();
     if (cap_) {
         FinishCapture(front);
     } else if (g_capture.exchange(false) && CaptureOn()) {
@@ -4464,7 +4645,7 @@ void VulkanBackend::Present(const Surface& front) {
     if (presents_ % 600 == 0) SaveShaderCaches();  // about every 10 s, what was compiled since
     ResizeSwap();
     Target* t = EnsureTarget(front, false);
-    if (t && LatchCpuWrite(*t)) UploadTarget(*t, front);
+    if (t && CpuWrote(*t)) UploadTarget(*t, front);
     if (ramp_dirty_) UploadGammaRamp();
     Transition(*lut_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
 
@@ -4508,6 +4689,36 @@ void VulkanBackend::ApplySettings() {
     }
 }
 
+
+// Shadows, light by light. Each light near the player casts the player's and the squad's shadows in a block of its
+// own: the shadow map (a depth target whose colour target is the game's dummy at address 0, nothing reads it) is
+// cleared and the casters drawn into it, then the scene is drawn again reading it, (1 - lit) * colour blended as
+// dest * (1 - src), darkening it where the light is blocked. Two lights in a room gave the player two shadows, and in
+// a firefight muzzle flashes and impacts are lights too, each block a blended re-draw of the scene round the player.
+// Past the frame's first block (the game's first light, its main one), or every block with SHADOWS off, the map
+// and its re-draw are left out: the scene is drawn as if nothing blocked that light.
+bool VulkanBackend::SkipShadow(const State& s) {
+    uint32_t most = game::Opt().shadows ? 1 : 0;
+    if (s.zs.header && (!s.rt.header || !s.rt.data)) {
+        if (!in_shadow_map_) shadow_light_++;  // a map again after other drawing: the next light's
+        in_shadow_map_ = true;
+        shadow_maps_.insert(TargetMapKey(mem::VirtualFromPhysical(s.zs.data), true));
+        return shadow_light_ > most;
+    }
+    in_shadow_map_ = false;
+    if (shadow_light_ <= most || shadow_maps_.empty()) return false;
+    for (uint32_t tex : s.textures) {
+        TextureDesc d;
+        if (tex && Describe(tex, d) && shadow_maps_.count(TargetMapKey(d.data, true))) return true;
+    }
+    return false;
+}
+
+// Present: the lights are counted again for the next frame
+void VulkanBackend::EndShadowFrame() {
+    shadow_light_ = 0;
+    in_shadow_map_ = false;
+}
 
 // the target resolved, then shrunk with o when it is not guest sized BGRA; res null on failure
 VulkanBackend::CopySource VulkanBackend::PrepareCopySource(Target& t, const ShrinkOptions& o) {
@@ -4589,6 +4800,7 @@ bool VulkanBackend::DeliverLate(uint32_t data) {
         uint8_t* dst = static_cast<uint8_t*>(kernel::HostPtr(data));
         for (uint32_t y = 0; y < l.gh; y++) std::memcpy(dst + size_t(y) * pitch, rb.map + size_t(y) * l.gw * 4, l.gw * 4);
         l.delivered = l.fence[best];
+        l.delivered_sig = l.bytes ? GuestSig(data, l.bytes) : 0;
     }
     return true;
 }
@@ -4640,12 +4852,27 @@ void VulkanBackend::RecordLate(uint32_t data) {
         if (diag::Perf()) LOG_FIRST(16, "perf: late %08X ring reset, %ux%u -> %ux%u", data, l.gw, l.gh, t.gw, t.gh);
         ResetLate(l, t);
     }
+    l.bytes = t.bytes;
     // a copy for a later lock, unless the GPU is a whole ring behind
     uint32_t slot = l.next;
     if (l.fence[slot] > CompletedFence()) return;
     Image* src = PrepareLateSource(t, l);
     if (!src) return;
     RecordLateCopy(l, slot, src);
+}
+
+// LatchCpuWrite, except that what DeliverLate put in guest memory is not the CPU's. That copy is a frame or two old:
+// taken for a CPU write, it was uploaded over what the frame had drawn into the target, the next late copy took the
+// old picture up again, and the screen cycled through a few old frames (the HUD's counters with them) for as long as
+// the title kept locking the surface NOOVERWRITE (the first mission's doorway, on a phone slow enough to be behind).
+// Under late_lock_, so DeliverLate does not write the memory while it is hashed
+bool VulkanBackend::CpuWrote(Target& t) {
+    if (DirtyEpoch(t.data) <= t.epoch) return false;
+    std::lock_guard lock(late_lock_);
+    auto it = late_.find(t.data);
+    uint64_t delivered = it != late_.end() ? it->second.delivered_sig : 0;
+    if (!LatchCpuWrite(t)) return false;
+    return !delivered || t.sig != delivered;
 }
 
 // filters src into a w x h BGRA target, new or o.into, left as a copy source

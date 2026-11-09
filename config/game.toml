@@ -12,6 +12,14 @@ library = "CGT.dll"  # <exe>.dll, which the executable delay loads
 
 # extra entry points
 [functions]
+# a mission script's callback, reached only through its table (0x1AA00 call ecx) and placed straight after the
+# string "LV.bExitCampDone==FALSE", so the scan took it for data
+0x31F25C = ""
+# mission 4's callback, registered the same way (mov esi, 0x36F704) and also only reached through 0x1AA00 call ecx
+0x36F704 = ""
+# last slot (28) of the vtable at 0x3D2400, set by the constructors at 0x7E5E2 and 0x7E6B4; only reached by a virtual call,
+# and the string "Rat.sbk" right after the table hid it from the scan
+0x7F32A = ""
 
 # functions the host replaces or calls by name, 0 where the image has none
 [symbols]

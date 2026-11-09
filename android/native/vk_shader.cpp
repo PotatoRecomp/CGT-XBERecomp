@@ -165,6 +165,8 @@ void Init(const std::filesystem::path& cache_dir, bool clip_distance, bool point
     g_dir = ec ? std::filesystem::path() : cache_dir;
 }
 
+bool Cached(uint64_t hash, std::vector<uint32_t>& spirv) { return Load(hash, spirv); }
+
 bool Compile(const std::string& hlsl, const char* entry, Stage stage, uint64_t hash, std::vector<uint32_t>& spirv) {
     if (Load(hash, spirv)) return true;
     std::lock_guard lock(g_lock);

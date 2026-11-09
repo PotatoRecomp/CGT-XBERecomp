@@ -220,12 +220,14 @@ void Script(input::Pad& p) {
     }
 }
 
-// the keys and mouse buttons held, added to the pad; only while the game window has focus
+// the keys and mouse buttons held, added to the pad; only while the game window has focus. The pad itself stays
+// plugged in without it: dropped with the focus (another window clicked, the app minimized on Android), port 0 went
+// missing and the game stopped on "Lost Controller" until START was pressed again
 void Keyboard(input::Pad& p) {
+    p.connected = true;
     if (!input::Focused()) return;
     const bool* keys = SDL_GetKeyboardState(nullptr);
     if (!keys) return;
-    p.connected = true;
     for (auto [key, button] : kButtons)
         if (keys[key]) p.buttons |= button;
     for (auto [key, analog] : kAnalogs)

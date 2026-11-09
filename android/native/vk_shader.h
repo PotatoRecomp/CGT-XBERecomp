@@ -20,5 +20,7 @@ enum class Stage { Vertex, Fragment };
 void Init(const std::filesystem::path& cache_dir, bool clip_distance, bool point_size);
 // hash names the module in the cache: the renderer's hash of the source, entry and profile
 bool Compile(const std::string& hlsl, const char* entry, Stage stage, uint64_t hash, std::vector<uint32_t>& spirv);
+// the module a Compile with this hash stored on disk, without the source; false when there is none. Any thread
+bool Cached(uint64_t hash, std::vector<uint32_t>& spirv);
 
 }  // namespace vkshader
