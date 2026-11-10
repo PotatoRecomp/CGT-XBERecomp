@@ -3,6 +3,7 @@ package com.datfooldive.cgt;
 import android.app.Dialog;
 import android.graphics.drawable.ColorDrawable;
 import android.graphics.drawable.GradientDrawable;
+import android.view.InputDevice;
 import android.view.Gravity;
 import android.view.KeyEvent;
 import android.view.View;
@@ -45,6 +46,7 @@ class SettingsDialog extends Dialog {
     // what reload() puts back into each widget from v
     private final List<Runnable> refreshers = new ArrayList<>();
     private View hdrRow;
+    private View mouseRows;  // shown only while a mouse is plugged in
 
     SettingsDialog(CGTActivity activity) {
         super(activity);
@@ -117,6 +119,7 @@ class SettingsDialog extends Dialog {
     @Override
     protected void onStart() {
         super.onStart();
+        mouseRows.setVisibility(mouseConnected() ? View.VISIBLE : View.GONE);
         Window window = getWindow();
         if (window == null) return;
         window.setBackgroundDrawable(new ColorDrawable(0));
@@ -191,10 +194,24 @@ class SettingsDialog extends Dialog {
         lp.bottomMargin = dp(4);
         box.addView(edit, lp);
 
-        heading(box, "MOUSE");
-        toggle(box, "MOUSE LOOK", MOUSE_LOOK);
-        slider(box, "MOUSE SENSITIVITY", MOUSE_SENSITIVITY, 5, 500, 5, SettingsDialog::scale);
-        toggle(box, "MOUSE INVERT Y", MOUSE_INVERT_Y);
+        LinearLayout mouse = new LinearLayout(getContext());
+        mouse.setOrientation(LinearLayout.VERTICAL);
+        heading(mouse, "MOUSE");
+        toggle(mouse, "MOUSE LOOK", MOUSE_LOOK);
+        slider(mouse, "MOUSE SENSITIVITY", MOUSE_SENSITIVITY, 5, 500, 5, SettingsDialog::scale);
+        toggle(mouse, "MOUSE INVERT Y", MOUSE_INVERT_Y);
+        box.addView(mouse, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT));
+        mouseRows = mouse;
+    }
+
+    // a real mouse (USB, Bluetooth, a tablet's keyboard cover) is plugged in: the touch screen is not one
+    private static boolean mouseConnected() {
+        for (int id : InputDevice.getDeviceIds()) {
+            InputDevice d = InputDevice.getDevice(id);
+            if (d != null && !d.isVirtual() && d.supportsSource(InputDevice.SOURCE_MOUSE)) return true;
+        }
+        return false;
     }
 
     private void audio(LinearLayout box) {
