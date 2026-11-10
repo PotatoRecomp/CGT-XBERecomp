@@ -16,25 +16,12 @@ OUT = Path(os.environ.get("CONTROLS_OUT", ROOT / "app" / "src" / "main" / "res" 
 PX = 256          # the PNG's side
 C, R = 130, 100   # the control's centre and radius in the box
 
-GLYPH = "#e6e6e6"
-DEFS = """<defs>
-<radialGradient id='body' cx='50%' cy='50%' r='50%'>
-  <stop offset='0' stop-color='#fff' stop-opacity='0.03'/>
-  <stop offset='0.62' stop-color='#fff' stop-opacity='0.03'/>
-  <stop offset='1' stop-color='#fff' stop-opacity='0.10'/>
-</radialGradient>
-<radialGradient id='bodyon' cx='50%' cy='50%' r='50%'>
-  <stop offset='0' stop-color='#fff' stop-opacity='0.10'/>
-  <stop offset='0.62' stop-color='#fff' stop-opacity='0.14'/>
-  <stop offset='1' stop-color='#fff' stop-opacity='0.24'/>
-</radialGradient>
-<filter id='soft' x='-20%' y='-20%' width='140%' height='140%'><feGaussianBlur stdDeviation='5'/></filter>
-</defs>"""
+
 
 
 def svg(body):
     return (f"<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 260 260' width='{PX}' height='{PX}'>"
-            f"{DEFS}{body}</svg>")
+            f"{body}</svg>")
 
 
 def circle_line(on, r=R):
@@ -68,64 +55,46 @@ def button_combo(xbox, action, on, xbox_size=68, r=R):
 
 
 def arrow(dx, dy, on):
-    """A d-pad arrow: a round key with a solid triangle pointing its way."""
-    t = R * 0.36
+    """A d-pad arrow: an open chevron line pointing its way in a circle line, brighter and bolder when held."""
+    t = R * 0.42
     tip = (C + dx * t, C + dy * t)
-    b1 = (C - dx * t * 0.55 - dy * t * 0.85, C - dy * t * 0.55 + dx * t * 0.85)
-    b2 = (C - dx * t * 0.55 + dy * t * 0.85, C - dy * t * 0.55 - dx * t * 0.85)
-    tri = (f"<polygon points='{tip[0]:.2f},{tip[1]:.2f} {b1[0]:.2f},{b1[1]:.2f} {b2[0]:.2f},{b2[1]:.2f}' "
-           f"fill='{GLYPH}' stroke='{GLYPH}' stroke-width='8' stroke-linejoin='round'/>")
-    return svg(circle_line(on) + tri)
-
-
-def disc(on, r=R):
-    shape = f"<circle cx='{C}' cy='{C}' r='{r - 1.5}' {{style}}/>"
-    glow = f"<circle cx='{C}' cy='{C}' r='{r - 4}' {{style}}/>"
-    out = shape.format(style=f"fill='url(#{'bodyon' if on else 'body'})'")
-    out += (f"<clipPath id='in{r:.0f}'><circle cx='{C}' cy='{C}' r='{r}'/></clipPath>"
-            f"<g clip-path='url(#in{r:.0f})'>" +
-            glow.format(style=f"fill='none' stroke='#fff' stroke-opacity='{0.35 if on else 0.18}' "
-                              f"stroke-width='10' filter='url(#soft)'") + "</g>")
-    out += shape.format(style=f"fill='none' stroke='#fff' stroke-opacity='{0.65 if on else 0.4}' stroke-width='2.5'")
-    return out
+    b1 = (C - dx * t * 0.25 - dy * t * 0.95, C - dy * t * 0.25 + dx * t * 0.95)
+    b2 = (C - dx * t * 0.25 + dy * t * 0.95, C - dy * t * 0.25 - dx * t * 0.95)
+    pts = f"{b1[0]:.2f},{b1[1]:.2f} {tip[0]:.2f},{tip[1]:.2f} {b2[0]:.2f},{b2[1]:.2f}"
+    w = 17 if on else 14
+    line = "<polyline points='{p}' fill='none' stroke='{c}' stroke-opacity='{o}' stroke-width='{w}' " \
+           "stroke-linecap='round' stroke-linejoin='round'/>"
+    return svg(circle_line(on) + line.format(p=pts, c="#000000", o="0.30", w=w + 5) +
+               line.format(p=pts, c="#ffffff", o="0.95" if on else "0.60", w=w))
 
 
 def stick_base():
-    """The stick's well: a wide see-through disc, an inner ring where the thumb travels, and four small notches."""
-    out = disc(False)
-    out += (f"<circle cx='{C}' cy='{C}' r='{R * 0.62}' fill='none' stroke='#fff' stroke-opacity='0.14' "
-            f"stroke-width='3'/>")
-    for dx, dy in ((0, -1), (0, 1), (-1, 0), (1, 0)):
-        x, y = C + dx * R * 0.82, C + dy * R * 0.82
-        out += f"<circle cx='{x:.1f}' cy='{y:.1f}' r='4.5' fill='#fff' fill-opacity='0.35'/>"
-    return svg(out)
+    """The stick's well: one thin ring."""
+    return svg(f"<circle cx='{C}' cy='{C}' r='{R - 3}' fill='#ffffff' fill-opacity='0.04' stroke='#ffffff' "
+               f"stroke-opacity='0.45' stroke-width='3'/>")
 
 
 def knob(on):
-    """The thumb: the same soft raised disc, fuller in the middle."""
-    r = R * 0.94
-    return svg(f"<circle cx='{C}' cy='{C}' r='{r}' fill='#fff' fill-opacity='{0.18 if on else 0.10}'/>"
-               f"<clipPath id='in'><circle cx='{C}' cy='{C}' r='{r}'/></clipPath>"
-               f"<g clip-path='url(#in)'><circle cx='{C}' cy='{C}' r='{r - 3}' fill='none' stroke='#fff' "
-               f"stroke-opacity='{0.35 if on else 0.2}' stroke-width='10' filter='url(#soft)'/></g>"
-               f"<circle cx='{C}' cy='{C}' r='{r - 1.5}' fill='none' stroke='#fff' "
-               f"stroke-opacity='{0.65 if on else 0.45}' stroke-width='2.5'/>")
+    """The thumb: a plain filled disc."""
+    return svg(f"<circle cx='{C}' cy='{C}' r='{R * 0.9:.1f}' fill='#ffffff' fill-opacity='{0.45 if on else 0.25}' "
+               f"stroke='#ffffff' stroke-opacity='{0.8 if on else 0.5}' stroke-width='3'/>")
 
 
 def gear(on):
-    """Settings: a cog with a hole inside a circle line."""
+    """Settings: a cog drawn as a line, six teeth round a hole, inside a circle line."""
     pts = []
-    step = 2 * math.pi / 8
-    outer, inner = R * 0.56, R * 0.42
-    for i in range(8):
-        for k, rr in ((-0.28, inner), (-0.15, outer), (0.15, outer), (0.28, inner)):
-            a = i * step + k * step
+    teeth = 6
+    step = 2 * math.pi / teeth
+    outer, inner = R * 0.50, R * 0.36
+    for i in range(teeth):
+        for k, rr in ((-0.25, inner), (-0.14, outer), (0.14, outer), (0.25, inner)):
+            a = i * step + k * step - math.pi / 2
             pts.append(f"{C + math.cos(a) * rr:.2f},{C + math.sin(a) * rr:.2f}")
-    h = R * 0.18
+    stroke = (f"fill='none' stroke='#ffffff' stroke-opacity='{0.95 if on else 0.75}' stroke-width='{9 if on else 7}' "
+              f"stroke-linejoin='round'")
     return svg(circle_line(on) +
-               f"<path fill-rule='evenodd' fill='{GLYPH}' d='M{' L'.join(pts)} Z "
-               f"M{C + h},{C} A{h},{h} 0 1 0 {C - h},{C} A{h},{h} 0 1 0 {C + h},{C} Z' stroke='{GLYPH}' "
-               f"stroke-width='3' stroke-linejoin='round'/>")
+               f"<polygon points='{' '.join(pts)}' {stroke}/>"
+               f"<circle cx='{C}' cy='{C}' r='{R * 0.14:.1f}' {stroke}/>")
 
 
 # Xbox button + small in-game action label (empty where the keyboard mapping gives the button no name):
@@ -140,7 +109,7 @@ BUTTONS = {
     "r3": ("R3", "AIM", 50),
     "white": ("WHITE", "", 36),
     "black": ("BLACK", "", 36),
-    "start": ("START", "PAUSE", 36),
+    "start": ("START", "", 40),
     "back": ("BACK", "", 44),
 }
 
