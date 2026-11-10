@@ -76,3 +76,6 @@ Fixes over the stock SDK and the `xbe_symbols` output:
 
 ## Game Hooks
 Game specific fixes go in `src/game`. Define `X86_FUNC(sub_XXXXXXXX)` to replace a recompiled function and call `__imp__sub_XXXXXXXX` to reach the original. Functions the analysis misses go in `[functions]` of `config/game.toml`.
+
+## License
+Licensed under the [GNU General Public License v3.0](LICENSE), with the additional terms in [NOTICE](NOTICE) (GPLv3 section 7): every copy and fork must keep the attribution to datfooldive, a modified version must be marked as changed and must not be presented as the original or an official release, and a distributed fork must use its own name. The SDK in `sdk/` stays under its MIT License, and third party code under its own. No game code or assets are part of it, and it is not affiliated with the game's owners or Microsoft.

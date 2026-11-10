@@ -1,0 +1,45 @@
+Conflict: Global Terror - XBE Recomp
+Copyright (C) 2026 datfooldive (https://github.com/datfooldive)
+
+This program is free software: you can redistribute it and/or modify it under the terms of the GNU General Public
+License as published by the Free Software Foundation, either version 3 of the License, or (at your option) any later
+version, with the additional terms below.
+
+This program is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied
+warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
+You should have received a copy of the GNU General Public License along with this program (LICENSE). If not, see
+<https://www.gnu.org/licenses/>.
+
+
+ADDITIONAL TERMS (GNU GPL version 3, section 7)
+
+These terms apply to every part of this program covered by the GPL, as section 7 of the license allows, and must be
+kept with every copy, modified or not.
+
+1. Attribution (section 7(b)). Every copy, modified or not, and every work based on this program must keep this NOTICE
+   file and the author attribution "Conflict: Global Terror - XBE Recomp by datfooldive
+   (https://github.com/datfooldive)" in its Appropriate Legal Notices and in its source.
+
+2. Origin (section 7(c)). The origin of this program must not be misrepresented: no one may claim to have written the
+   original program. A modified version must be marked as changed in a reasonable way, stating that it is modified and
+   by whom, and must not be presented as the original or as an official release.
+
+3. Names (section 7(d)). The names of the licensor and authors may not be used to endorse or promote a modified version
+   without their written permission.
+
+4. Trademarks (section 7(e)). No right is granted to use the project's name or any trade name, trademark or service
+   mark of its authors to identify a modified version; a modified version that is distributed must use a different
+   name. The name may still be used to describe the program's origin as item 1 requires.
+
+
+WHAT THESE TERMS COVER
+
+The GPL and the terms above apply to everything in this repository written for this port, except:
+
+- sdk/, the Xbox XBE Recomp SDK by TGP482 (https://github.com/TGP482/XboxXBE-Recomp), which stays under its own MIT
+  License (sdk/LICENSE), with the third party software it lists (sdk/THIRD_PARTY.txt, sdk/tools/LLVM-LICENSE.txt).
+- Other third party code, in this repository (android/third_party) or fetched when it is built, which stays under its
+  own license.
+- Conflict: Global Terror itself. No game code or assets are part of this program, and these terms grant no rights in
+  the game, its code, its assets or its names, which belong to their owners, or in Xbox, which belongs to Microsoft.
+  This port is not affiliated with or endorsed by any of them.
