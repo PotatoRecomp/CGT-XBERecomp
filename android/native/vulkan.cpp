@@ -81,6 +81,10 @@ namespace {
 constexpr int kFrames = 3;
 // the vertex, index and constant data of a frame; a phone's frame is a few megabytes, and the ring is pinned memory
 constexpr uint64_t kUploadSize = 32ull << 20;
+// a frame slot's ring grows to what its frames need, up to this (GrowUpload)
+constexpr uint64_t kMostUploadSize = 64ull << 20;
+constexpr VkBufferUsageFlags kUploadUsage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
+                                            VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
 // b0 and b1 are dynamic uniform buffers of this range, bound at each draw's offsets: the larger of the vertex
 // constants and DrawConstants, every constant upload reserving all of it
 constexpr uint64_t kUboRange = (std::max<uint64_t>(sizeof(gpu::State::vsc), sizeof(gpu::DrawConstants)) + 255) & ~255ull;
@@ -1145,7 +1149,9 @@ private:
         std::vector<VkCommandBuffer> passes;  // each pass's draws (EnsureRendering), reused frame after frame
         size_t pass_at = 0;
         BufferRef upload;
+        uint64_t upload_size = 0;     // the ring's bytes
         uint64_t used = 0;
+        uint64_t overflow_bytes = 0;  // asked of the ring this frame and given buffers of their own instead
         uint64_t fence = 0;
         std::vector<ImageRef> garbage;
         std::vector<BufferRef> garbage_buffers;
@@ -1364,6 +1370,7 @@ private:
     void SubmitPresent(bool acquired, uint32_t bi);
     void ReleaseOldTextures();
     void ResetFrame();
+    void GrowUpload(Frame& f);
     void CrumbBegin();
     void CrumbEnd();
     void CrumbPass(bool executed);
@@ -2270,10 +2277,8 @@ void VulkanBackend::CreateFrames() {
         ai.commandBufferCount = 1;
         VK_CHECK(vkAllocateCommandBuffers(dev_, &ai, &f.cmd));
         VK_CHECK(vkAllocateCommandBuffers(dev_, &ai, &f.pre));
-        f.upload = CreateBuffer(kUploadSize,
-                                VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
-                                    VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-                                false);
+        f.upload = CreateBuffer(kUploadSize, kUploadUsage, false);
+        f.upload_size = kUploadSize;
         VkSemaphoreCreateInfo si{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
         VK_CHECK(vkCreateSemaphore(dev_, &si, nullptr, &f.acquired));
     }
@@ -2436,16 +2441,14 @@ VulkanBackend::Alloc VulkanBackend::Upload(uint64_t size, uint64_t align) {
     Frame& f = CurrentFrame();
     g_perf.upload += size;
     uint64_t o = (f.used + align - 1) & ~(align - 1);
-    if (o + size <= kUploadSize) {
+    if (o + size <= f.upload_size) {
         f.used = o + size;
         return {f.upload->buffer, o, f.upload->map + o};
     }
-    // too big for the ring: a buffer of its own, released with the frame
+    // too big for the ring: a buffer of its own, released with the frame; the ring grows for the slot's next frame
     g_perf.overflow++;
-    BufferRef b = CreateBuffer(std::max<uint64_t>(size, 1),
-                               VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
-                                   VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-                               false);
+    f.overflow_bytes += size + align;
+    BufferRef b = CreateBuffer(std::max<uint64_t>(size, 1), kUploadUsage, false);
     f.garbage_buffers.push_back(b);
     return {b->buffer, 0, b->map};
 }
@@ -6028,6 +6031,7 @@ void VulkanBackend::ResetFrame() {
         g_perf.wait += PerfMs(perf_wait);
     }
     CrumbCheck(f, "frame");
+    GrowUpload(f);
     vkResetCommandPool(dev_, f.pool, 0);
     f.pass_at = 0;
     ResetPools(f);
@@ -6040,6 +6044,24 @@ void VulkanBackend::ResetFrame() {
     vkBeginCommandBuffer(cl_, &bi);
     Begin();
     CrumbBegin();
+}
+
+// A frame that overflowed its slot's upload ring made a buffer for each upload past it: a driver allocation for every
+// draw left, which on a phone's GPU (Helio G99's Mali-G57, a big outdoor view) cost more than the draws. The slot's
+// ring is made again, its frame done on the GPU, big enough for what that frame asked, up to kMostUploadSize
+void VulkanBackend::GrowUpload(Frame& f) {
+    const uint64_t need = f.used + f.overflow_bytes;
+    f.overflow_bytes = 0;
+    if (need <= f.upload_size || f.upload_size >= kMostUploadSize || device_lost_) return;
+    uint64_t size = f.upload_size;
+    while (size < need + need / 4 && size < kMostUploadSize) size *= 2;
+    size = std::min(size, kMostUploadSize);
+    BufferRef ring = CreateBuffer(size, kUploadUsage, false);
+    if (!ring) return;  // the old ring and its overflow buffers, as before
+    LOGR("vulkan: upload ring of frame slot %llu grown to %llu MB (a frame asked %.1f MB)",
+         (unsigned long long)(frame_ % kFrames), (unsigned long long)(size >> 20), need / 1048576.0);
+    f.upload = std::move(ring);
+    f.upload_size = size;
 }
 
 // the barrier before a breadcrumb: every command recorded before it has finished, not merely started
