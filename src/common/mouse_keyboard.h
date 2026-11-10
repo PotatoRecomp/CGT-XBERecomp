@@ -15,6 +15,8 @@ void OnMouseMotion(float dx, float dy);  // window thread: a relative motion eve
 // Touch look (Android): a finger's travel in dp, x right and y down, added up beside the mouse's counts and turned the
 // same way, straight into the look angles rather than through the right stick; any thread
 void OnTouchLook(float dx, float dy);
+// Android gyro: integrated rotation in degrees, x right and y down. Zeroes clear pending gyro motion.
+void OnGyroLook(float yaw, float pitch);
 // game thread: the turn asked for since the last take in degrees, each source's sensitivity and invert Y applied, x
 // right and y down, before the zoom's scaling; false when there is none. Motion that waited longer than a moment (the
 // game paused, a cutscene, a menu) is dropped rather than turned all at once.

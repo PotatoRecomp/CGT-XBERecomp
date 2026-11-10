@@ -6,6 +6,7 @@
 // X86_FUNC(sub_00012345) {
 //     __imp__sub_00012345(ctx, base);  // the original
 // }
+#include <algorithm>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -38,6 +39,81 @@ void WF(uint32_t va, float f) {
 }
 
 }  // namespace
+
+#ifdef __ANDROID__
+// CanTakeDamage (thiscall, ret): 0x905DD checks this before subtracting damage from +0x13C;
+// bullets/explosions (0xAA4E7) and environmental damage also consult it. +4 == 1 is a character,
+// +0x15 its team; 0x43B7E8 is the player's team, as the game's own cheats check it (0x95700).
+X86_EXTERN_FUNC(__imp__sub_0008F938);
+X86_FUNC(sub_0008F938) {
+    uint32_t unit = ctx.ecx;
+    if (game::Opt().infinite_health && R32(unit + 4) == 1
+            && kernel::G<uint8_t>(unit + 0x15) == kernel::G<uint8_t>(0x43B7E8)) {
+        ctx.eax = 0;
+        ctx.esp += 4;
+        return;
+    }
+    __imp__sub_0008F938(ctx, base);
+}
+
+// +0x54 is total ammo, including reserve; +0x78 counts spent magazine rounds (0x9D2AC).
+// Refill before readiness checks and after firing so an empty magazine never requests a reload.
+namespace {
+bool FillMagazine(uint32_t weapon, uint32_t unit) {
+    if (!game::Opt().infinite_ammo || !unit || R32(unit + 4) != 1
+            || kernel::G<uint8_t>(unit + 0x15) != kernel::G<uint8_t>(0x43B7E8)
+            || R32(weapon + 4) != 6) return false;
+    uint32_t capacity = kernel::R16(R32(weapon + 0x24) + 0xB0);
+    if (!capacity) return false;
+    W32(weapon + 0x54, std::max(R32(weapon + 0x54), capacity));
+    W32(weapon + 0x78, 0);
+    return true;
+}
+}  // namespace
+
+X86_EXTERN_FUNC(__imp__sub_00095700);
+X86_FUNC(sub_00095700) {
+    FillMagazine(ctx.ecx, R32(ctx.esp + 4));
+    __imp__sub_00095700(ctx, base);
+}
+
+X86_EXTERN_FUNC(__imp__sub_0009D37A);
+X86_FUNC(sub_0009D37A) {
+    uint32_t weapon = ctx.ecx, unit = R32(ctx.esp + 4);
+    bool freeze = FillMagazine(weapon, unit);
+    uint32_t ammo = freeze ? R32(weapon + 0x54) : 0;
+    __imp__sub_0009D37A(ctx, base);
+    if (freeze) {
+        // Restoring only the magazine lets total ammo drain until reserve reaches zero.
+        W32(weapon + 0x54, ammo);
+        W32(weapon + 0x78, 0);
+    }
+}
+
+// Throwable use (thiscall, ret 0xC): 0x971B9 decrements +0x54, outside the gun's firing path.
+// Preserve the starting count rather than waiting for the built-in cheat's empty-item refill.
+X86_EXTERN_FUNC(__imp__sub_00096975);
+X86_FUNC(sub_00096975) {
+    uint32_t item = ctx.ecx, unit = R32(ctx.esp + 4);
+    bool freeze = game::Opt().infinite_ammo && unit && R32(unit + 4) == 1
+            && kernel::G<uint8_t>(unit + 0x15) == kernel::G<uint8_t>(0x43B7E8);
+    uint32_t count = freeze ? R32(item + 0x54) : 0;
+    __imp__sub_00096975(ctx, base);
+    if (freeze) W32(item + 0x54, count);
+}
+
+// The built-in infinite-ammo query (cdecl, ret). 0x95700 supplies rounds when checking a player's
+// weapon; 0x96975 refills it when the last round fires, and 0x9D37A suppresses the empty-ammo action.
+X86_EXTERN_FUNC(__imp__sub_000A5522);
+X86_FUNC(sub_000A5522) {
+    if (game::Opt().infinite_ammo) {
+        ctx.eax = 1;
+        ctx.esp += 4;
+        return;
+    }
+    __imp__sub_000A5522(ctx, base);
+}
+#endif
 
 // 60 fps. The renderer's frame pacer (0x112D2D, thiscall on the renderer) waits for vertical blanks until the
 // present interval its present parameters hold at +0xAC has passed since the last frame, then swaps: 2 on the

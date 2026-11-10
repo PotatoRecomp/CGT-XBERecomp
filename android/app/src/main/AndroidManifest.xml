@@ -5,6 +5,8 @@
     <uses-feature android:name="android.hardware.touchscreen" android:required="true" />
     <uses-feature android:name="android.hardware.gamepad" android:required="false" />
 
+    <uses-feature android:name="android.hardware.sensor.gyroscope" android:required="false" />
+
     <!-- controllers SDL reads itself -->
     <uses-permission android:name="android.permission.VIBRATE" />
     <!-- the game's files in a CGT folder on the shared storage, when the player allows it -->

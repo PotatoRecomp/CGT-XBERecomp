@@ -6,6 +6,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -35,6 +36,7 @@ uint64_t NowMs() {
 std::mutex g_look_lock;
 double g_look_x = 0, g_look_y = 0;
 double g_touch_x = 0, g_touch_y = 0;
+double g_gyro_x = 0, g_gyro_y = 0;
 uint64_t g_look_taken = 0;           // NowMs of the last take
 constexpr uint64_t kLookStaleMs = 250;  // counts older than this were made while nothing turned the view
 
@@ -77,15 +79,27 @@ void OnTouchLook(float dx, float dy) {
     g_touch_y += dy;
 }
 
+void OnGyroLook(float yaw, float pitch) {
+    if (!std::isfinite(yaw) || !std::isfinite(pitch)) return;
+    std::lock_guard lock(g_look_lock);
+    if ((yaw == 0 && pitch == 0) || app::MenuOpen()) {
+        g_gyro_x = g_gyro_y = 0;
+        return;
+    }
+    g_gyro_x += yaw;
+    g_gyro_y += pitch;
+}
+
 bool TakeLook(float& yaw, float& pitch) {
     uint64_t now = NowMs();
-    double mx, my, tx, ty;
+    double mx, my, tx, ty, gx, gy;
     {
         std::lock_guard lock(g_look_lock);
         bool stale = now - g_look_taken > kLookStaleMs;
         g_look_taken = now;
         mx = g_look_x, my = g_look_y, tx = g_touch_x, ty = g_touch_y;
-        g_look_x = g_look_y = g_touch_x = g_touch_y = 0;
+        gx = g_gyro_x, gy = g_gyro_y;
+        g_look_x = g_look_y = g_touch_x = g_touch_y = g_gyro_x = g_gyro_y = 0;
         if (stale) return false;
     }
     const game::Options& o = game::Opt();
@@ -99,6 +113,11 @@ bool TakeLook(float& yaw, float& pitch) {
         float degrees = game::kTouchDegreesPerDp * float(o.touch_sensitivity) * 0.01f;
         yaw += float(tx) * degrees;
         pitch += float(o.touch_invert_y ? -ty : ty) * degrees;
+    }
+    if (o.gyro_look) {
+        float scale = float(o.gyro_sensitivity) * 0.01f;
+        yaw += float(gx) * scale;
+        pitch += float(o.gyro_invert_y ? -gy : gy) * scale;
     }
     return yaw != 0 || pitch != 0;
 }

@@ -52,6 +52,9 @@ The `android` folder builds the same recompiled code into an APK for arm64 phone
 - **Settings:** the F10 panel is an Android dialog (`SettingsDialog.java`), opened by the gear at the top of the screen or F10 on a keyboard, with the desktop panel's display, graphics, screen filter and audio rows plus the touch controls'. Values are saved as they change.
 - **Touch controls:** the Xbox pad's buttons and left stick as an overlay (`TouchControls.java`), each control movable and sizable (MOVE CONTROLS). There is no on-screen right stick: a finger dragged on the free right side of the screen, or a thumb held on FIRE, turns the view the way the mouse does, its travel in dp added straight to the game's look angles (**LOOK SENSITIVITY** 1.00 is 0.25 degrees a dp, **LOOK INVERT Y**). A controller plugged in hides the overlay; a mouse still turns the view through mouse look.
 
+- **Gyroscope:** enable **GYRO LOOK** under Settings → Controls to aim by rotating the phone, alongside touch or controller input. **GYRO SENSITIVITY** 1.00 turns one degree per degree of phone rotation before zoom scaling; **GYRO INVERT Y** reverses vertical motion. Gyro is off by default, stops while the app is inactive or settings/layout editing is open, and requires a device with a gyroscope.
+- **Cheats:** the Android settings panel's **CHEATS** tab has **INFINITE HEALTH** (prevents damage to characters on the player's team) and **INFINITE AMMO & THROWABLES** (keeps your team's weapon magazines loaded without reloading and preserves grenade, smoke, and other throwable counts). Both default to off, save with settings, and turn off with DEFAULTS. Health protection does not revive fallen characters or prevent scripted mission failures.
+
 ### Building for Android
 1. Add the game to `assets`, as for Linux.
 2. Install the Android SDK with NDK 30.0.16138531 and CMake 3.22.1 (Android Studio's SDK manager), JDK 17, and CMake, Ninja, Git and a C++ compiler for this PC.

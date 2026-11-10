@@ -30,7 +30,9 @@ class SettingsDialog extends Dialog {
     static final int RESOLUTION = 0, MSAA = 1, SMAA = 2, FXAA = 3, ANISO = 4, BLOOM = 5, FOG = 6, HDR = 7,
             HDR_AVAILABLE = 8, SCREEN_FILTER = 9, VSYNC = 10, FPS_CAP = 11, FRAME_RATE_60 = 12, FPS_COUNTER = 13,
             TOUCH_SENSITIVITY = 14, TOUCH_INVERT_Y = 15, OPACITY = 16, MOUSE_LOOK = 17, MOUSE_SENSITIVITY = 18,
-            MOUSE_INVERT_Y = 19, VOLUME = 20, OUT_W = 21, OUT_H = 22, FRAME_SKIP = 23, ASYNC_SHADERS = 24, SHADOWS = 25, COUNT = 26;
+            MOUSE_INVERT_Y = 19, VOLUME = 20, OUT_W = 21, OUT_H = 22, FRAME_SKIP = 23, ASYNC_SHADERS = 24, SHADOWS = 25,
+            GYRO_LOOK = 26, GYRO_SENSITIVITY = 27, GYRO_INVERT_Y = 28,
+            INFINITE_HEALTH = 29, INFINITE_AMMO = 30, COUNT = 31;
 
     private static final int BG = Theme.BG, TEXT = Theme.TEXT, FRAME = Theme.FRAME,
             BUTTON = Theme.BUTTON, BUTTON_ON = Theme.BUTTON_ON, SELECTED = Theme.SELECTED;
@@ -39,7 +41,7 @@ class SettingsDialog extends Dialog {
     private final int[] v = new int[COUNT];
     private boolean loading;  // a reload filling the widgets is not a change to write back
 
-    private static final String[] TAB_NAMES = {"DISPLAY", "GRAPHICS", "CONTROLS", "AUDIO"};
+    private static final String[] TAB_NAMES = {"DISPLAY", "GRAPHICS", "CONTROLS", "AUDIO", "CHEATS"};
     private final TextView[] tabs = new TextView[TAB_NAMES.length];
     private final LinearLayout[] pages = new LinearLayout[TAB_NAMES.length];
     private ScrollView scroll;
@@ -97,6 +99,7 @@ class SettingsDialog extends Dialog {
         graphics(pages[1]);
         controls(pages[2]);
         audio(pages[3]);
+        cheats(pages[4]);
 
         LinearLayout holder = new LinearLayout(activity);
         holder.setOrientation(LinearLayout.VERTICAL);
@@ -194,6 +197,15 @@ class SettingsDialog extends Dialog {
         lp.bottomMargin = dp(4);
         box.addView(edit, lp);
 
+        heading(box, "GYROSCOPE");
+        if (activity.hasGyroscope()) {
+            toggle(box, "GYRO LOOK", GYRO_LOOK);
+            slider(box, "GYRO SENSITIVITY", GYRO_SENSITIVITY, 10, 500, 5, SettingsDialog::scale);
+            toggle(box, "GYRO INVERT Y", GYRO_INVERT_Y);
+        } else {
+            box.addView(text("No gyroscope available on this device", 13, TEXT));
+        }
+
         LinearLayout mouse = new LinearLayout(getContext());
         mouse.setOrientation(LinearLayout.VERTICAL);
         heading(mouse, "MOUSE");
@@ -216,6 +228,12 @@ class SettingsDialog extends Dialog {
 
     private void audio(LinearLayout box) {
         slider(box, "VOLUME", VOLUME, 50, 400, 25, value -> value + "%");
+    }
+
+    private void cheats(LinearLayout box) {
+        heading(box, "CHEATS");
+        toggle(box, "INFINITE HEALTH", INFINITE_HEALTH);
+        toggle(box, "INFINITE AMMO & THROWABLES", INFINITE_AMMO);
     }
 
     // a percentage of a sensitivity as the desktop panel writes it, 1.00 for 100

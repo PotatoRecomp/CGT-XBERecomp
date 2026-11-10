@@ -46,6 +46,9 @@ public class CGTActivity extends SDLActivity {
     private final GameImporter importer = new GameImporter(this);
     private boolean importing;  // the file picker or the copy is up: nothing else is asked meanwhile
     private TouchControls controls;
+    private GyroControls gyro;
+    private boolean resumed;
+    private boolean gyroEnabled;
 
     @Override
     protected String[] getLibraries() {
@@ -56,6 +59,7 @@ public class CGTActivity extends SDLActivity {
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         current = this;
+        gyro = new GyroControls(this);
         fillDisplay();
         // the controls over the game's surface, taking every touch on it
         if (mLayout != null) {
@@ -69,6 +73,7 @@ public class CGTActivity extends SDLActivity {
 
     @Override
     protected void onDestroy() {
+        if (gyro != null) gyro.setActive(false);
         if (current == this) current = null;
         if (editor != null) editor.hide();
         super.onDestroy();
@@ -124,9 +129,11 @@ public class CGTActivity extends SDLActivity {
         settings.setOnDismissListener(d -> {
             settings = null;
             nativeSettingsOpen(false);
+            updateGyro();
             hideSystemBars();
         });
         nativeSettingsOpen(true);
+        updateGyro();
         settings.show();
         hideSystemBars();
     }
@@ -141,6 +148,7 @@ public class CGTActivity extends SDLActivity {
 
     // a value in the panel changed: the controls read their opacity from it, the layout with DEFAULTS
     void settingsChanged() {
+        reloadGyro();
         if (controls == null) return;
         controls.reloadSettings();
         controls.reloadLayout();
@@ -154,7 +162,22 @@ public class CGTActivity extends SDLActivity {
             controls.reloadLayout();
             controls.reloadSettings();
             controls.setPad(pad);
+            reloadGyro();
         });
+    }
+
+    boolean hasGyroscope() { return gyro != null && gyro.available(); }
+
+    private void reloadGyro() {
+        int[] values = nativeSettings();
+        gyroEnabled = values != null && values.length > SettingsDialog.GYRO_LOOK
+                && values[SettingsDialog.GYRO_LOOK] != 0;
+        updateGyro();
+    }
+
+    void updateGyro() {
+        if (gyro != null) gyro.setActive(gyroEnabled && resumed && hasWindowFocus() && settings == null
+                && (controls == null || !controls.isEditing()));
     }
 
     private static boolean loose(InputEvent e, int sources) {
@@ -189,12 +212,16 @@ public class CGTActivity extends SDLActivity {
     @Override
     protected void onResume() {
         super.onResume();
+        resumed = true;
+        updateGyro();
         hideSystemBars();
         askForGame();
     }
 
     @Override
     protected void onPause() {
+        resumed = false;
+        updateGyro();
         nativeLooseRelease();  // its ups go elsewhere while the game is not in front
         if (controls != null) controls.releaseAll();
         super.onPause();
@@ -232,6 +259,7 @@ public class CGTActivity extends SDLActivity {
     @Override
     public void onWindowFocusChanged(boolean hasFocus) {
         super.onWindowFocusChanged(hasFocus);
+        updateGyro();
         if (hasFocus) {
             hideSystemBars();
             recoverIfStuck();

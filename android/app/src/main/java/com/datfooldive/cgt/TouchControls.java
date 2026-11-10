@@ -141,12 +141,16 @@ class TouchControls extends View {
         releaseAll();
         this.editor = editor;
         editing = true;
+        activity.updateGyro();
         selected = drag = -1;
         invalidate();
     }
 
+    boolean isEditing() { return editing; }
+
     void endEdit() {
         editing = false;
+        activity.updateGyro();
         selected = drag = -1;
         editor = null;
         invalidate();
