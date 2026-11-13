@@ -20,6 +20,8 @@ library = "CGT.dll"  # <exe>.dll, which the executable delay loads
 # last slot (28) of the vtable at 0x3D2400, set by the constructors at 0x7E5E2 and 0x7E6B4; only reached by a virtual call,
 # and the string "Rat.sbk" right after the table hid it from the scan
 0x7F32A = ""
+# callback reached through a game function pointer
+0x3403CD = ""
 
 # functions the host replaces or calls by name, 0 where the image has none
 [symbols]

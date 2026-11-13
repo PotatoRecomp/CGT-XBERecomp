@@ -57,13 +57,17 @@ else
     (cd "$REPO" && "$ANDROID_DIR/out/host/xbe_symbols" "assets/$GAME_XBE" sdk/xdk --library CGT.dll \
         --out config/game.toml) || fail "Read the last message above."
 fi
-if [ -f "$REPO/generated/game/x86_func_mapping.cpp" ]; then
-    echo "      generated/game is there"
+# regenerate whenever the config or the xbe changed since the last run, as the desktop build's codegen.stamp rule does
+STAMP="$REPO/generated/game/codegen.stamp"
+if [ -f "$REPO/generated/game/x86_func_mapping.cpp" ] && [ -f "$STAMP" ] &&
+   [ ! "$REPO/config/game.toml" -nt "$STAMP" ] && [ ! "$REPO/assets/$GAME_XBE" -nt "$STAMP" ]; then
+    echo "      generated/game is up to date"
 else
     echo "      recompiling $GAME_XBE: 15 to 60 minutes on weaker systems ..."
     [ -x out/host/xbe_recomp ] || host_tools
     (cd "$REPO" && "$ANDROID_DIR/out/host/xbe_recomp" config/game.toml --xdk sdk/xdk) ||
         fail "Read the last message above."
+    touch "$STAMP"
 fi
 
 # ---------------------------------------------------------------- apk
